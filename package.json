@@ -1,0 +1,40 @@
+{
+  "name": "matrix-claude-bot",
+  "version": "1.0.0",
+  "description": "Matrix bot that acts as a remote terminal for Claude Code. Send text, audio, or images from any Matrix client and get Claude Code responses.",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint src/ tests/",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "matrix",
+    "claude",
+    "bot",
+    "ai",
+    "claude-code",
+    "speech-to-text"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@matrix-org/matrix-sdk-crypto-nodejs": "^0.4.0",
+    "marked": "^17.0.4",
+    "matrix-bot-sdk": "^0.7.1",
+    "ws": "^8.19.0"
+  },
+  "devDependencies": {
+    "@types/marked": "^5.0.2",
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.1",
+    "eslint": "^9.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}
