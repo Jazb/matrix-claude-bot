@@ -32,7 +32,7 @@ export function generateHooksSettings(socketPath: string, hookTimeout: number): 
   const settings = {
     hooks: {
       SessionStart: [hookEntry()],
-      PreToolUse: [hookEntry("AskUserQuestion")],
+      PreToolUse: [hookEntry()],
       Stop: [hookEntry()],
       Notification: [hookEntry()],
     },

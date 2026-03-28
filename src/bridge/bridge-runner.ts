@@ -241,6 +241,31 @@ export class BridgeRunner {
         formatted_body: html,
       });
       await this.matrix.setTyping(roomId, false);
+    } else {
+      // Tool permission request — notify user to approve/deny
+      let text = `**Permission Required**: \`${payload.tool_name}\`\n`;
+
+      const toolInput = payload.tool_input;
+      if (toolInput) {
+        if (payload.tool_name === "Bash" && toolInput.command) {
+          text += `\n\`\`\`bash\n${String(toolInput.command)}\n\`\`\``;
+        } else if ((payload.tool_name === "Edit" || payload.tool_name === "Write") && toolInput.file_path) {
+          text += `\nFile: \`${String(toolInput.file_path)}\``;
+        } else {
+          text += `\n\`\`\`json\n${JSON.stringify(toolInput, null, 2)}\n\`\`\``;
+        }
+      }
+
+      text += `\n\n_Reply "y" to allow or "n" to deny._`;
+
+      const html = await marked.parse(text);
+      await this.matrix.client.sendMessage(roomId, {
+        msgtype: "m.text",
+        body: text,
+        format: "org.matrix.custom.html",
+        formatted_body: html,
+      });
+      await this.matrix.setTyping(roomId, false);
     }
   }
 
