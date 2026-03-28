@@ -63,6 +63,7 @@ export function loadConfig(): AppConfig {
       allowedUserId: required("MATRIX_ALLOWED_USER_ID"),
       enableE2ee: optional("MATRIX_ENABLE_E2EE", "true") === "true",
       cryptoStoragePath: optional("MATRIX_CRYPTO_STORAGE_PATH", "./data/crypto"),
+      password: optional("MATRIX_PASSWORD", ""),
     },
     projects: {
       projects,

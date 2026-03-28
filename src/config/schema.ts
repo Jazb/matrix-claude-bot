@@ -18,6 +18,8 @@ export interface MatrixConfig {
   enableE2ee: boolean;
   /** Directory for crypto storage (Olm/Megolm keys) */
   cryptoStoragePath: string;
+  /** Matrix account password — used for cross-signing bootstrap (optional) */
+  password: string;
 }
 
 // -- Project mapping --

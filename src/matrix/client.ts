@@ -41,9 +41,17 @@ import { createDecipheriv } from "crypto";
 import type { MatrixConfig, BotConfig } from "../config/schema.js";
 import { createLogger } from "../utils/logger.js";
 
-// Silence matrix-js-sdk internal logging (FetchHttpApi, sync, crypto DEBUG spam)
-import loglevel from "loglevel";
-loglevel.setLevel("SILENT");
+// Redirect matrix-js-sdk console output to stderr to keep stdout/app logs clean.
+// SDK logs are visible via `pm2 logs --err` or stderr redirection.
+// Set LOG_LEVEL=debug to keep SDK logs on stdout instead.
+if (process.env["LOG_LEVEL"] !== "debug") {
+  const _stderr = (prefix: string) => (...args: unknown[]) =>
+    process.stderr.write(`${prefix} ${args.join(" ")}\n`);
+  console.log = _stderr("[sdk]");
+  console.debug = _stderr("[sdk:debug]");
+  console.info = _stderr("[sdk:info]");
+  console.warn = _stderr("[sdk:warn]");
+}
 
 const log = createLogger("matrix");
 
@@ -163,36 +171,8 @@ export async function createMatrixClient(
           useIndexedDB: true,
           cryptoDatabasePrefix: "matrix-claude-bot-crypto",
         });
-      }
 
-      await client.startClient({ initialSyncLimit: 0 } as IStartClientOpts);
-
-      // Wait for first sync to complete and record timestamp to filter old events
-      await new Promise<void>((resolve) => {
-        const onSync = (state: string): void => {
-          if (state === "PREPARED") {
-            client.removeListener(ClientEvent.Sync, onSync);
-            syncTimestamp = Date.now();
-            initialSyncDone = true;
-            resolve();
-          }
-        };
-        client.on(ClientEvent.Sync, onSync);
-      });
-
-      log.info("Matrix sync started" + (matrixConfig.enableE2ee ? " (E2EE active)" : ""));
-
-      // Save device ID for future restarts
-      const currentDeviceId = client.getDeviceId();
-      if (currentDeviceId) {
-        saveDeviceId(storageDir, currentDeviceId);
-      }
-
-      // Bootstrap cross-signing and verify own device
-      if (matrixConfig.enableE2ee) {
-        await setupCrossSigning(client, userId);
-
-        // Set up SAS verification handler for interactive emoji verification
+        // Register SAS verification handler BEFORE startClient so we don't miss events
         client.on(CryptoEvent.VerificationRequestReceived, async (request) => {
           if (request.initiatedByMe) return;
           if (verificationInProgress) {
@@ -251,6 +231,34 @@ export async function createMatrixClient(
             verificationInProgress = false;
           }
         });
+      }
+
+      await client.startClient({ initialSyncLimit: 0 } as IStartClientOpts);
+
+      // Wait for first sync to complete and record timestamp to filter old events
+      await new Promise<void>((resolve) => {
+        const onSync = (state: string): void => {
+          if (state === "PREPARED") {
+            client.removeListener(ClientEvent.Sync, onSync);
+            syncTimestamp = Date.now();
+            initialSyncDone = true;
+            resolve();
+          }
+        };
+        client.on(ClientEvent.Sync, onSync);
+      });
+
+      log.info("Matrix sync started" + (matrixConfig.enableE2ee ? " (E2EE active)" : ""));
+
+      // Save device ID for future restarts
+      const currentDeviceId = client.getDeviceId();
+      if (currentDeviceId) {
+        saveDeviceId(storageDir, currentDeviceId);
+      }
+
+      // Bootstrap cross-signing and verify own device
+      if (matrixConfig.enableE2ee) {
+        await setupCrossSigning(client, userId, matrixConfig.password);
       }
     },
 
@@ -491,21 +499,37 @@ export async function createMatrixClient(
 }
 
 /** Bootstrap cross-signing and verify own device for E2EE trust. */
-async function setupCrossSigning(client: MatrixClient, userId: string): Promise<void> {
+async function setupCrossSigning(client: MatrixClient, userId: string, password: string): Promise<void> {
   const crypto = client.getCrypto();
   if (!crypto) {
     log.warn("Crypto not available, skipping cross-signing setup");
     return;
   }
 
+  // Allow sharing room keys with unverified devices
+  crypto.globalBlacklistUnverifiedDevices = false;
+
   const deviceId = client.getDeviceId()!;
 
-  // Bootstrap cross-signing keys
-  try {
-    await crypto.bootstrapCrossSigning({});
-    log.info("Cross-signing keys bootstrapped");
-  } catch (err) {
-    log.warn(`Cross-signing bootstrap: ${err instanceof Error ? err.message : String(err)}`);
+  // Bootstrap cross-signing keys (requires password for auth)
+  if (password) {
+    try {
+      await crypto.bootstrapCrossSigning({
+        setupNewCrossSigning: false,
+        authUploadDeviceSigningKeys: async (makeRequest) => {
+          await makeRequest({
+            type: "m.login.password",
+            identifier: { type: "m.id.user", user: userId },
+            password,
+          });
+        },
+      });
+      log.info("Cross-signing bootstrapped");
+    } catch (err) {
+      log.warn(`Cross-signing bootstrap: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  } else {
+    log.warn("MATRIX_PASSWORD not set — cross-signing bootstrap skipped. Set it for full E2EE verification.");
   }
 
   // Mark own device as verified
