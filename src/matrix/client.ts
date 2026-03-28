@@ -31,7 +31,6 @@ import {
   MemoryStore,
   type MatrixClient,
   type MatrixEvent as MatrixEventType,
-  type Room,
   type IStartClientOpts,
 } from "matrix-js-sdk";
 import { writeFileSync, readFileSync, existsSync, mkdirSync } from "fs";
@@ -302,9 +301,9 @@ export async function createMatrixClient(
     on(event: string, handler: (...args: any[]) => void): void {
       switch (event) {
         case "room.message": {
-          const processMessage = (matrixEvent: MatrixEventType, room: Room | undefined): void => {
+          const processMessage = (matrixEvent: MatrixEventType): void => {
             if (matrixEvent.getType() !== EventType.RoomMessage) return;
-            const roomId = room?.roomId ?? matrixEvent.getRoomId();
+            const roomId = matrixEvent.getRoomId();
             if (!roomId) return;
             handler(roomId, {
               sender: matrixEvent.getSender(),
@@ -313,18 +312,30 @@ export async function createMatrixClient(
             });
           };
 
-          client.on(RoomEvent.Timeline, (matrixEvent, room, toStartOfTimeline) => {
+          // Listener 1: unencrypted messages — process immediately
+          client.on(RoomEvent.Timeline, (matrixEvent, _room, toStartOfTimeline) => {
             if (toStartOfTimeline) return;
+            if (matrixEvent.isEncrypted()) return;
+            processMessage(matrixEvent);
+          });
 
-            // If the event is still being decrypted, wait for decryption
-            if (matrixEvent.isBeingDecrypted()) {
-              matrixEvent.once(MatrixEventEvent.Decrypted, () => {
-                processMessage(matrixEvent, room ?? undefined);
-              });
+          // Listener 2: encrypted messages — wait for decryption
+          client.on(RoomEvent.Timeline, (matrixEvent, _room, toStartOfTimeline) => {
+            if (toStartOfTimeline) return;
+            if (!matrixEvent.isEncrypted()) return;
+
+            if (matrixEvent.isDecryptionFailure?.()) return;
+
+            // If already decrypted (keys were available), process immediately
+            if (matrixEvent.getType() === EventType.RoomMessage) {
+              processMessage(matrixEvent);
               return;
             }
 
-            processMessage(matrixEvent, room ?? undefined);
+            // Otherwise wait for the decryption event
+            matrixEvent.once(MatrixEventEvent.Decrypted, () => {
+              processMessage(matrixEvent);
+            });
           });
           break;
         }
