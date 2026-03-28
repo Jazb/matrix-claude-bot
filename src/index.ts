@@ -469,6 +469,16 @@ async function downloadContentToFile(
 await matrix.start();
 log.info(`Matrix Claude Bot started (${mode} mode)`);
 
+// Pre-start Claude sessions in bridge mode so the first message is instant
+if (mode === "bridge" && bridge) {
+  const joinedRooms = await matrix.client.getJoinedRooms();
+  for (const roomId of joinedRooms) {
+    bridge.warmup(roomId).catch((err) => {
+      log.warn(`Warmup failed for ${roomId}: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }
+}
+
 // Graceful shutdown
 function shutdown(signal: string) {
   log.info(`${signal} received, shutting down`);

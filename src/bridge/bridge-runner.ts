@@ -65,6 +65,17 @@ export class BridgeRunner {
   }
 
   /**
+   * Pre-start a Claude tmux session for a room so it's ready when the first message arrives.
+   */
+  async warmup(roomId: string): Promise<void> {
+    if (this.tmux.isAlive(roomId)) return;
+    log.info(`Warming up Claude session for room ${roomId}`);
+    await this.ensureSession(roomId);
+    await this.waitForReady(roomId);
+    log.info(`Warmup complete for room ${roomId}`);
+  }
+
+  /**
    * Handle a user message for a room.
    * Ensures a tmux session exists, then injects the text as input.
    * Returns null because responses arrive asynchronously via hooks.
