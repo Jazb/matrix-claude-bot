@@ -6,8 +6,8 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/index.js",
-    "dev": "tsx src/index.ts",
+    "start": "node --env-file=.env dist/index.js",
+    "dev": "node --env-file=.env node_modules/.bin/tsx src/index.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint src/ tests/",
