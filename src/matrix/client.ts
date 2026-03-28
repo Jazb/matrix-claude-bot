@@ -316,6 +316,7 @@ export async function createMatrixClient(
           client.on(RoomEvent.Timeline, (matrixEvent, _room, toStartOfTimeline) => {
             if (toStartOfTimeline) return;
             if (matrixEvent.isEncrypted()) return;
+            log.debug(`[msg-handler] Unencrypted event: type=${matrixEvent.getType()} sender=${matrixEvent.getSender()}`);
             processMessage(matrixEvent);
           });
 
@@ -324,16 +325,21 @@ export async function createMatrixClient(
             if (toStartOfTimeline) return;
             if (!matrixEvent.isEncrypted()) return;
 
+            log.debug(`[msg-handler] Encrypted event: type=${matrixEvent.getType()} sender=${matrixEvent.getSender()} decryptionFailure=${matrixEvent.isDecryptionFailure?.()} beingDecrypted=${matrixEvent.isBeingDecrypted()}`);
+
             if (matrixEvent.isDecryptionFailure?.()) return;
 
             // If already decrypted (keys were available), process immediately
             if (matrixEvent.getType() === EventType.RoomMessage) {
+              log.debug(`[msg-handler] Already decrypted, processing`);
               processMessage(matrixEvent);
               return;
             }
 
             // Otherwise wait for the decryption event
+            log.debug(`[msg-handler] Waiting for decryption...`);
             matrixEvent.once(MatrixEventEvent.Decrypted, () => {
+              log.debug(`[msg-handler] Decrypted: type=${matrixEvent.getType()} sender=${matrixEvent.getSender()} failure=${matrixEvent.isDecryptionFailure?.()}`);
               processMessage(matrixEvent);
             });
           });

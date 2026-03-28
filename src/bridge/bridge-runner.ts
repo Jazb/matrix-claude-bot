@@ -142,8 +142,8 @@ export class BridgeRunner {
       const start = Date.now();
       const interval = setInterval(() => {
         const lines = this.tmux.captureLines(roomId, 5);
-        // Claude Code shows ">" or "❯" when ready for input
-        if (lines && /[>❯]\s*$/.test(lines)) {
+        // Claude Code shows "❯" or ">" on a line when ready for input
+        if (lines && /[>❯]/m.test(lines)) {
           clearInterval(interval);
           log.info(`Claude session ready for room ${roomId}`);
           resolve();
