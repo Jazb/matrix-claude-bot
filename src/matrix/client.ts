@@ -25,10 +25,13 @@ import {
   ClientEvent,
   RoomEvent,
   RoomMemberEvent,
+  MatrixEventEvent,
   EventType,
   MsgType,
   MemoryStore,
   type MatrixClient,
+  type MatrixEvent as MatrixEventType,
+  type Room,
   type IStartClientOpts,
 } from "matrix-js-sdk";
 import { writeFileSync, readFileSync, existsSync, mkdirSync } from "fs";
@@ -298,9 +301,8 @@ export async function createMatrixClient(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     on(event: string, handler: (...args: any[]) => void): void {
       switch (event) {
-        case "room.message":
-          client.on(RoomEvent.Timeline, (matrixEvent, room, toStartOfTimeline) => {
-            if (toStartOfTimeline) return;
+        case "room.message": {
+          const processMessage = (matrixEvent: MatrixEventType, room: Room | undefined): void => {
             if (matrixEvent.getType() !== EventType.RoomMessage) return;
             const roomId = room?.roomId ?? matrixEvent.getRoomId();
             if (!roomId) return;
@@ -309,8 +311,23 @@ export async function createMatrixClient(
               type: matrixEvent.getType(),
               content: matrixEvent.getContent(),
             });
+          };
+
+          client.on(RoomEvent.Timeline, (matrixEvent, room, toStartOfTimeline) => {
+            if (toStartOfTimeline) return;
+
+            // If the event is still being decrypted, wait for decryption
+            if (matrixEvent.isBeingDecrypted()) {
+              matrixEvent.once(MatrixEventEvent.Decrypted, () => {
+                processMessage(matrixEvent, room ?? undefined);
+              });
+              return;
+            }
+
+            processMessage(matrixEvent, room ?? undefined);
           });
           break;
+        }
 
         case "room.join":
           client.on(RoomMemberEvent.Membership, (_ev, member) => {
