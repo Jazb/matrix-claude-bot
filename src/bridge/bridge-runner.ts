@@ -234,12 +234,7 @@ export class BridgeRunner {
       }
 
       const html = await marked.parse(text);
-      await this.matrix.client.sendMessage(roomId, {
-        msgtype: "m.text",
-        body: text,
-        format: "org.matrix.custom.html",
-        formatted_body: html,
-      });
+      await this.matrix.sendHtmlMessage(roomId, text, html);
       await this.matrix.setTyping(roomId, false);
     } else {
       // Tool permission request — notify user to approve/deny
@@ -259,12 +254,7 @@ export class BridgeRunner {
       text += `\n\n_Reply "y" to allow or "n" to deny._`;
 
       const html = await marked.parse(text);
-      await this.matrix.client.sendMessage(roomId, {
-        msgtype: "m.text",
-        body: text,
-        format: "org.matrix.custom.html",
-        formatted_body: html,
-      });
+      await this.matrix.sendHtmlMessage(roomId, text, html);
       await this.matrix.setTyping(roomId, false);
     }
   }
@@ -283,12 +273,7 @@ export class BridgeRunner {
     const chunks = splitMessage(message, this.config.bot.maxMessageLength);
     for (const chunk of chunks) {
       const html = await marked.parse(chunk);
-      await this.matrix.client.sendMessage(roomId, {
-        msgtype: "m.text",
-        body: chunk,
-        format: "org.matrix.custom.html",
-        formatted_body: html,
-      });
+      await this.matrix.sendHtmlMessage(roomId, chunk, html);
     }
   }
 
@@ -328,12 +313,7 @@ export class BridgeRunner {
       text += `\n\n_Reply "y" to allow or "n" to deny._`;
 
       const html = await marked.parse(text);
-      await this.matrix.client.sendMessage(roomId, {
-        msgtype: "m.text",
-        body: text,
-        format: "org.matrix.custom.html",
-        formatted_body: html,
-      });
+      await this.matrix.sendHtmlMessage(roomId, text, html);
     }
   }
 

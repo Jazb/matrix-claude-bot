@@ -396,12 +396,7 @@ export class IdeRunner {
     const chunks = splitMessage(text, this.config.bot.maxMessageLength);
     for (const chunk of chunks) {
       const html = await marked.parse(chunk);
-      await this.matrix.client.sendMessage(roomId, {
-        msgtype: "m.text",
-        body: chunk,
-        format: "org.matrix.custom.html",
-        formatted_body: html,
-      });
+      await this.matrix.sendHtmlMessage(roomId, chunk, html);
     }
   }
 

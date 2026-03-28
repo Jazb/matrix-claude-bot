@@ -1,36 +1,30 @@
 /**
- * Matrix client wrapper.
+ * Matrix client wrapper using matrix-js-sdk.
  *
  * Handles connection to the Matrix homeserver, authentication validation,
- * media download, and optional E2EE (end-to-end encryption) support.
- * Uses matrix-bot-sdk under the hood with RustSdkCryptoStorageProvider
- * for encryption key management.
- *
- * Inspired by Jackpoint's matrix-bridge.js but simplified for a single-user
- * bot scenario (no room management by session key — we use DM or a fixed room).
+ * media download, E2EE with cross-signing and device verification,
+ * and provides a clean interface for the rest of the application.
  */
 
 import {
-  MatrixClient,
-  SimpleFsStorageProvider,
-  RustSdkCryptoStorageProvider,
-  AutojoinRoomsMixin,
-  LogService,
-  LogLevel,
-} from "matrix-bot-sdk";
-import { writeFileSync, existsSync, mkdirSync } from "fs";
-import { dirname } from "path";
+  createClient,
+  ClientEvent,
+  RoomEvent,
+  RoomMemberEvent,
+  EventType,
+  MsgType,
+  MemoryStore,
+  type MatrixClient,
+  type IStartClientOpts,
+} from "matrix-js-sdk";
+import { writeFileSync, readFileSync, existsSync, mkdirSync } from "fs";
+import { dirname, join } from "path";
 import { marked } from "marked";
+import { createDecipheriv } from "crypto";
 import type { MatrixConfig, BotConfig } from "../config/schema.js";
 import { createLogger } from "../utils/logger.js";
 
 const log = createLogger("matrix");
-
-/** Suppress matrix-bot-sdk's verbose internal logging. */
-function silenceSdkLogs(level: string): void {
-  const sdkLevel = level === "debug" ? LogLevel.DEBUG : LogLevel.WARN;
-  LogService.setLevel(sdkLevel);
-}
 
 /** Encrypted file metadata from E2EE media messages. */
 export interface EncryptedFileInfo {
@@ -42,137 +36,185 @@ export interface EncryptedFileInfo {
 }
 
 export interface MatrixClientWrapper {
-  client: MatrixClient;
   userId: string;
   start: () => Promise<void>;
   stop: () => void;
   sendText: (roomId: string, text: string) => Promise<string>;
+  sendHtmlMessage: (roomId: string, text: string, html: string) => Promise<string>;
   sendNotice: (roomId: string, text: string) => Promise<string>;
   setTyping: (roomId: string, typing: boolean) => Promise<void>;
   downloadMedia: (mxcUrl: string, destPath: string) => Promise<void>;
   downloadEncryptedMedia: (file: EncryptedFileInfo, destPath: string) => Promise<void>;
+  getJoinedRooms: () => Promise<string[]>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  on: (event: string, handler: (...args: any[]) => void) => void;
+}
+
+/** Persist device ID across restarts for E2EE key continuity. */
+function loadDeviceId(storageDir: string): string | undefined {
+  const path = join(storageDir, "device_id");
+  if (existsSync(path)) {
+    return readFileSync(path, "utf-8").trim();
+  }
+  return undefined;
+}
+
+function saveDeviceId(storageDir: string, deviceId: string): void {
+  const path = join(storageDir, "device_id");
+  writeFileSync(path, deviceId);
+}
+
+/** Base64url decode (used by Matrix encrypted attachments). */
+function base64urlDecode(str: string): Buffer {
+  // Add padding if needed
+  const padded = str + "=".repeat((4 - (str.length % 4)) % 4);
+  return Buffer.from(padded.replace(/-/g, "+").replace(/_/g, "/"), "base64");
 }
 
 export async function createMatrixClient(
   matrixConfig: MatrixConfig,
   botConfig: BotConfig,
 ): Promise<MatrixClientWrapper> {
-  silenceSdkLogs(botConfig.logLevel);
-
   // Ensure storage directory exists
   const storageDir = dirname(botConfig.sessionsFile);
   if (!existsSync(storageDir)) {
     mkdirSync(storageDir, { recursive: true });
   }
-  const storagePath = `${storageDir}/matrix-storage.json`;
-  const storage = new SimpleFsStorageProvider(storagePath);
 
-  // Set up E2EE crypto store if enabled
-  let cryptoStore: RustSdkCryptoStorageProvider | undefined;
-  if (matrixConfig.enableE2ee) {
-    const cryptoDir = matrixConfig.cryptoStoragePath;
-    if (!existsSync(cryptoDir)) {
-      mkdirSync(cryptoDir, { recursive: true });
+  // Resolve userId via whoami before creating the full client
+  const whoamiResp = await fetch(`${matrixConfig.homeserverUrl}/_matrix/client/v3/account/whoami`, {
+    headers: { Authorization: `Bearer ${matrixConfig.accessToken}` },
+  });
+  if (!whoamiResp.ok) {
+    throw new Error("Failed to authenticate with Matrix homeserver. Check MATRIX_ACCESS_TOKEN.");
+  }
+  const whoami = (await whoamiResp.json()) as { user_id: string; device_id?: string };
+  const userId = whoami.user_id;
+  log.info(`Authenticated as ${userId}`);
+
+  // Load or use device ID
+  let deviceId = loadDeviceId(storageDir) ?? whoami.device_id;
+  if (!deviceId) {
+    // Will be assigned by server on first sync; we save it after start
+    deviceId = undefined as unknown as string;
+  }
+
+  const client: MatrixClient = createClient({
+    baseUrl: matrixConfig.homeserverUrl,
+    accessToken: matrixConfig.accessToken,
+    userId,
+    deviceId,
+    store: new MemoryStore(),
+    useAuthorizationHeader: true,
+  });
+
+  // Auto-join rooms on invite
+  client.on(RoomMemberEvent.Membership, (_event, member) => {
+    if (member.membership === "invite" && member.userId === userId) {
+      client.joinRoom(member.roomId).catch((err: Error) => {
+        log.error(`Failed to auto-join ${member.roomId}: ${err.message}`);
+      });
     }
-    // RustSdkCryptoStorageProvider expects a StoreType enum value.
-    // The second argument maps to the Rust SDK store backend.
-    // Passing undefined lets the SDK use its default (Sqlite).
-    cryptoStore = new RustSdkCryptoStorageProvider(cryptoDir);
-    log.info("E2EE crypto store initialized");
-  }
-
-  const client = new MatrixClient(
-    matrixConfig.homeserverUrl,
-    matrixConfig.accessToken,
-    storage,
-    cryptoStore,
-  );
-
-  // Auto-join rooms the bot is invited to (so the allowed user can DM us)
-  AutojoinRoomsMixin.setupOnClient(client);
-
-  // Validate token and get our user ID
-  let userId: string;
-  try {
-    userId = await client.getUserId();
-    log.info(`Authenticated as ${userId}`);
-  } catch (err) {
-    log.error("Failed to authenticate with Matrix homeserver. Check MATRIX_ACCESS_TOKEN.");
-    throw err;
-  }
+  });
 
   if (matrixConfig.enableE2ee) {
-    log.info("E2EE enabled — encrypted rooms will be supported");
+    log.info("E2EE enabled — initializing Rust crypto");
   }
 
   return {
-    client,
     userId,
 
     async start() {
-      await client.start();
+      // Initialize E2EE before starting sync
+      if (matrixConfig.enableE2ee) {
+        await client.initRustCrypto({ useIndexedDB: false });
+      }
+
+      await client.startClient({ initialSyncLimit: 0 } as IStartClientOpts);
+
+      // Wait for first sync to complete
+      await new Promise<void>((resolve) => {
+        const onSync = (state: string): void => {
+          if (state === "PREPARED") {
+            client.removeListener(ClientEvent.Sync, onSync);
+            resolve();
+          }
+        };
+        client.on(ClientEvent.Sync, onSync);
+      });
+
       log.info("Matrix sync started" + (matrixConfig.enableE2ee ? " (E2EE active)" : ""));
 
-      // Log device info for manual verification
+      // Save device ID for future restarts
+      const currentDeviceId = client.getDeviceId();
+      if (currentDeviceId) {
+        saveDeviceId(storageDir, currentDeviceId);
+      }
+
+      // Bootstrap cross-signing and verify own device
       if (matrixConfig.enableE2ee) {
-        try {
-          const ownDevices = await client.getOwnDevices();
-          const cryptoClient = client.crypto;
-          if (cryptoClient && ownDevices.length > 0) {
-            const deviceId = await cryptoStore!.getDeviceId();
-            log.info("━━━ Device Verification Info ━━━");
-            log.info(`  User:      ${userId}`);
-            log.info(`  Device ID: ${deviceId}`);
-            log.info("  To verify: In Element, go to the bot's profile → Sessions → click the device → 'Manually verify by text'");
-            log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-          }
-        } catch (err) {
-          log.debug(`Could not retrieve device info: ${err instanceof Error ? err.message : String(err)}`);
-        }
+        await setupCrossSigning(client, userId);
       }
     },
 
     stop() {
-      client.stop();
+      client.stopClient();
       log.info("Matrix sync stopped");
     },
 
     async sendText(roomId: string, text: string): Promise<string> {
       const html = await marked.parse(text);
-      return client.sendMessage(roomId, {
-        msgtype: "m.text",
+      const resp = await client.sendMessage(roomId, {
+        msgtype: MsgType.Text,
         body: text,
         format: "org.matrix.custom.html",
         formatted_body: html,
       });
+      return resp.event_id;
+    },
+
+    async sendHtmlMessage(roomId: string, text: string, html: string): Promise<string> {
+      const resp = await client.sendMessage(roomId, {
+        msgtype: MsgType.Text,
+        body: text,
+        format: "org.matrix.custom.html",
+        formatted_body: html,
+      });
+      return resp.event_id;
     },
 
     async sendNotice(roomId: string, text: string): Promise<string> {
-      return client.sendNotice(roomId, text);
+      const resp = await client.sendNotice(roomId, text);
+      return resp.event_id;
     },
 
     async setTyping(roomId: string, typing: boolean): Promise<void> {
       try {
-        await client.setTyping(roomId, typing, typing ? 30_000 : 0);
+        await client.sendTyping(roomId, typing, typing ? 30_000 : 0);
       } catch {
         // Typing indicator is best-effort
       }
     },
 
     async downloadMedia(mxcUrl: string, destPath: string): Promise<void> {
-      const data = await client.downloadContent(mxcUrl);
+      const httpUrl = client.mxcUrlToHttp(mxcUrl);
+      if (!httpUrl) throw new Error(`Cannot resolve mxc URL: ${mxcUrl}`);
+
+      const resp = await fetch(httpUrl, {
+        headers: { Authorization: `Bearer ${matrixConfig.accessToken}` },
+      });
+      if (!resp.ok) throw new Error(`Download failed: ${resp.status}`);
+
+      const buf = Buffer.from(await resp.arrayBuffer());
       const dir = dirname(destPath);
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-      writeFileSync(destPath, Buffer.from(data.data));
+      writeFileSync(destPath, buf);
       log.debug(`Downloaded media to ${destPath}`);
     },
 
     async downloadEncryptedMedia(file: EncryptedFileInfo, destPath: string): Promise<void> {
       log.debug(`Downloading encrypted media: ${file.url}`);
 
-      // matrix.org deprecated /_matrix/media/v3/download in favor of
-      // /_matrix/client/v1/media/download (authenticated). We download
-      // manually and then decrypt using the Rust crypto SDK.
       const mxcUrl = file.url;
       if (!mxcUrl?.startsWith("mxc://")) {
         throw new Error(`Invalid mxc URL: ${mxcUrl}`);
@@ -209,15 +251,139 @@ export async function createMatrixClient(
         throw new Error(`Failed to download media from ${mxcUrl}`);
       }
 
-      // Decrypt using the Rust crypto SDK directly
-      const { Attachment, EncryptedAttachment } = await import("@matrix-org/matrix-sdk-crypto-nodejs");
-      const encrypted = new EncryptedAttachment(encryptedData, JSON.stringify(file));
-      const decrypted = Attachment.decrypt(encrypted);
+      // Decrypt using AES-256-CTR (Matrix encrypted attachment spec)
+      const key = base64urlDecode(file.key.k);
+      const iv = base64urlDecode(file.iv);
+      // Matrix spec: only first 8 bytes of IV are used, rest are counter (zeroed)
+      const ivBytes = Buffer.alloc(16);
+      iv.copy(ivBytes, 0, 0, 8);
+
+      const decipher = createDecipheriv("aes-256-ctr", key, ivBytes);
+      const decrypted = Buffer.concat([decipher.update(encryptedData), decipher.final()]);
 
       const dir = dirname(destPath);
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-      writeFileSync(destPath, Buffer.from(decrypted));
+      writeFileSync(destPath, decrypted);
       log.debug(`Decrypted media saved to ${destPath}`);
     },
+
+    async getJoinedRooms(): Promise<string[]> {
+      const resp = await client.getJoinedRooms();
+      return resp.joined_rooms;
+    },
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    on(event: string, handler: (...args: any[]) => void): void {
+      switch (event) {
+        case "room.message":
+          client.on(RoomEvent.Timeline, (matrixEvent, room, toStartOfTimeline) => {
+            if (toStartOfTimeline) return;
+            if (matrixEvent.getType() !== EventType.RoomMessage) return;
+            const roomId = room?.roomId ?? matrixEvent.getRoomId();
+            if (!roomId) return;
+            handler(roomId, {
+              sender: matrixEvent.getSender(),
+              type: matrixEvent.getType(),
+              content: matrixEvent.getContent(),
+            });
+          });
+          break;
+
+        case "room.join":
+          client.on(RoomMemberEvent.Membership, (_ev, member) => {
+            if (member.userId === userId && member.membership === "join") {
+              handler(member.roomId);
+            }
+          });
+          break;
+
+        case "room.failed_decryption":
+          client.on(RoomEvent.Timeline, (matrixEvent, room) => {
+            if (matrixEvent.isDecryptionFailure?.()) {
+              const roomId = room?.roomId ?? matrixEvent.getRoomId();
+              handler(
+                roomId,
+                { sender: matrixEvent.getSender(), type: matrixEvent.getType() },
+                new Error("Decryption failed"),
+              );
+            }
+          });
+          break;
+
+        case "room.decrypted_event":
+          client.on(RoomEvent.Timeline, (matrixEvent, room, toStartOfTimeline) => {
+            if (toStartOfTimeline) return;
+            if (matrixEvent.isDecryptionFailure?.()) return;
+            const roomId = room?.roomId ?? matrixEvent.getRoomId();
+            handler(roomId, {
+              sender: matrixEvent.getSender(),
+              type: matrixEvent.getType(),
+            });
+          });
+          break;
+
+        case "room.event":
+          client.on(RoomEvent.Timeline, (matrixEvent, room) => {
+            const roomId = room?.roomId ?? matrixEvent.getRoomId();
+            handler(roomId, {
+              sender: matrixEvent.getSender(),
+              type: matrixEvent.getType(),
+              content: matrixEvent.getContent(),
+            });
+          });
+          break;
+
+        default:
+          log.warn(`Unknown event type for on(): ${event}`);
+      }
+    },
   };
+}
+
+/** Bootstrap cross-signing and verify own device for E2EE trust. */
+async function setupCrossSigning(client: MatrixClient, userId: string): Promise<void> {
+  const crypto = client.getCrypto();
+  if (!crypto) {
+    log.warn("Crypto not available, skipping cross-signing setup");
+    return;
+  }
+
+  const deviceId = client.getDeviceId()!;
+
+  // Bootstrap cross-signing keys
+  try {
+    await crypto.bootstrapCrossSigning({});
+    log.info("Cross-signing keys bootstrapped");
+  } catch (err) {
+    log.warn(`Cross-signing bootstrap: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // Mark own device as verified
+  try {
+    await crypto.setDeviceVerified(userId, deviceId);
+    log.info(`Device ${deviceId} marked as verified`);
+  } catch (err) {
+    log.warn(`Device self-verification: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // Cross-sign our device
+  try {
+    await crypto.crossSignDevice(deviceId);
+    log.info(`Device ${deviceId} cross-signed`);
+  } catch (err) {
+    log.warn(`Cross-signing device: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // Log verification status
+  try {
+    const status = await crypto.getDeviceVerificationStatus(userId, deviceId);
+    log.info("━━━ Device Verification Info ━━━");
+    log.info(`  User:      ${userId}`);
+    log.info(`  Device ID: ${deviceId}`);
+    log.info(`  Verified:  ${status?.isVerified() ?? false}`);
+    log.info(`  Cross-signed: ${status?.crossSigningVerified ?? false}`);
+    log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  } catch (err) {
+    log.debug(`Could not retrieve verification status: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }

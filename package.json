@@ -23,9 +23,8 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@matrix-org/matrix-sdk-crypto-nodejs": "^0.4.0",
     "marked": "^17.0.4",
-    "matrix-bot-sdk": "^0.7.1",
+    "matrix-js-sdk": "^41.2.0",
     "ws": "^8.19.0"
   },
   "devDependencies": {
