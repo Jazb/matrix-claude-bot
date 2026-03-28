@@ -71,8 +71,11 @@ export class BridgeRunner {
    */
   async handleMessage(roomId: string, prompt: string): Promise<null> {
     // Ensure tmux session exists for this room
-    if (!this.tmux.isAlive(roomId)) {
+    const isNew = !this.tmux.isAlive(roomId);
+    if (isNew) {
       await this.ensureSession(roomId);
+      // Wait for Claude Code to finish loading before sending input
+      await this.waitForReady(roomId);
     }
 
     // Inject the user's message into tmux
@@ -118,6 +121,31 @@ export class BridgeRunner {
   }
 
   // ── Private ────────────────────────────────────────────────────────────────
+
+  /**
+   * Wait for Claude Code to be ready after starting a new tmux session.
+   * Polls the tmux pane output looking for the input prompt indicator.
+   */
+  private waitForReady(roomId: string, timeoutMs: number = 30000): Promise<void> {
+    return new Promise((resolve) => {
+      const start = Date.now();
+      const interval = setInterval(() => {
+        const lines = this.tmux.captureLines(roomId, 5);
+        // Claude Code shows ">" or "❯" when ready for input
+        if (lines && /[>❯]\s*$/.test(lines)) {
+          clearInterval(interval);
+          log.info(`Claude session ready for room ${roomId}`);
+          resolve();
+          return;
+        }
+        if (Date.now() - start > timeoutMs) {
+          clearInterval(interval);
+          log.warn(`Timed out waiting for Claude to be ready in room ${roomId}, sending anyway`);
+          resolve();
+        }
+      }, 500);
+    });
+  }
 
   /** Ensure a tmux session exists for a room, creating one if needed. */
   private async ensureSession(roomId: string): Promise<void> {
