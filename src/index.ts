@@ -473,8 +473,14 @@ log.info(`Matrix Claude Bot started (${mode} mode)`);
 if (mode === "bridge" && bridge) {
   const joinedRooms = await matrix.getJoinedRooms();
   for (const roomId of joinedRooms) {
-    bridge.warmup(roomId).catch((err) => {
-      log.warn(`Warmup failed for ${roomId}: ${err instanceof Error ? err.message : String(err)}`);
+    bridge.warmup(roomId).catch(async (err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("M_FORBIDDEN")) {
+        log.warn(`No permission in ${roomId}, leaving room`);
+        await matrix.leaveRoom(roomId).catch(() => {});
+      } else {
+        log.warn(`Warmup failed for ${roomId}: ${msg}`);
+      }
     });
   }
 }

@@ -46,6 +46,7 @@ export interface MatrixClientWrapper {
   downloadMedia: (mxcUrl: string, destPath: string) => Promise<void>;
   downloadEncryptedMedia: (file: EncryptedFileInfo, destPath: string) => Promise<void>;
   getJoinedRooms: () => Promise<string[]>;
+  leaveRoom: (roomId: string) => Promise<void>;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   on: (event: string, handler: (...args: any[]) => void) => void;
 }
@@ -92,12 +93,12 @@ export async function createMatrixClient(
   const userId = whoami.user_id;
   log.info(`Authenticated as ${userId}`);
 
-  // Load or use device ID
-  let deviceId = loadDeviceId(storageDir) ?? whoami.device_id;
+  // Load persisted device ID, fall back to server's whoami response
+  const deviceId = loadDeviceId(storageDir) ?? whoami.device_id;
   if (!deviceId) {
-    // Will be assigned by server on first sync; we save it after start
-    deviceId = undefined as unknown as string;
+    throw new Error("No device_id available. Ensure your access token is associated with a device.");
   }
+  log.info(`Using device ID: ${deviceId}`);
 
   const client: MatrixClient = createClient({
     baseUrl: matrixConfig.homeserverUrl,
@@ -270,6 +271,11 @@ export async function createMatrixClient(
     async getJoinedRooms(): Promise<string[]> {
       const resp = await client.getJoinedRooms();
       return resp.joined_rooms;
+    },
+
+    async leaveRoom(roomId: string): Promise<void> {
+      await client.leave(roomId);
+      log.info(`Left room ${roomId}`);
     },
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
