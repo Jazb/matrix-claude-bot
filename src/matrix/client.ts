@@ -33,12 +33,17 @@ import {
   type MatrixEvent as MatrixEventType,
   type IStartClientOpts,
 } from "matrix-js-sdk";
+import { CryptoEvent, VerifierEvent } from "matrix-js-sdk/lib/crypto-api/index.js";
 import { writeFileSync, readFileSync, existsSync, mkdirSync } from "fs";
 import { dirname, join } from "path";
 import { marked } from "marked";
 import { createDecipheriv } from "crypto";
 import type { MatrixConfig, BotConfig } from "../config/schema.js";
 import { createLogger } from "../utils/logger.js";
+
+// Silence matrix-js-sdk internal logging (FetchHttpApi, sync, crypto DEBUG spam)
+import loglevel from "loglevel";
+loglevel.setLevel("SILENT");
 
 const log = createLogger("matrix");
 
@@ -63,6 +68,8 @@ export interface MatrixClientWrapper {
   downloadEncryptedMedia: (file: EncryptedFileInfo, destPath: string) => Promise<void>;
   getJoinedRooms: () => Promise<string[]>;
   leaveRoom: (roomId: string) => Promise<void>;
+  hasPendingSasConfirm: () => boolean;
+  confirmSas: () => void;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   on: (event: string, handler: (...args: any[]) => void) => void;
 }
@@ -116,6 +123,14 @@ export async function createMatrixClient(
   }
   log.info(`Using device ID: ${deviceId}`);
 
+  // Track sync state to filter old events on startup
+  let initialSyncDone = false;
+  let syncTimestamp = 0;
+
+  // SAS verification state
+  let verificationInProgress = false;
+  let pendingSasConfirm: (() => Promise<void>) | null = null;
+
   const client: MatrixClient = createClient({
     baseUrl: matrixConfig.homeserverUrl,
     accessToken: matrixConfig.accessToken,
@@ -152,11 +167,13 @@ export async function createMatrixClient(
 
       await client.startClient({ initialSyncLimit: 0 } as IStartClientOpts);
 
-      // Wait for first sync to complete
+      // Wait for first sync to complete and record timestamp to filter old events
       await new Promise<void>((resolve) => {
         const onSync = (state: string): void => {
           if (state === "PREPARED") {
             client.removeListener(ClientEvent.Sync, onSync);
+            syncTimestamp = Date.now();
+            initialSyncDone = true;
             resolve();
           }
         };
@@ -174,6 +191,66 @@ export async function createMatrixClient(
       // Bootstrap cross-signing and verify own device
       if (matrixConfig.enableE2ee) {
         await setupCrossSigning(client, userId);
+
+        // Set up SAS verification handler for interactive emoji verification
+        client.on(CryptoEvent.VerificationRequestReceived, async (request) => {
+          if (request.initiatedByMe) return;
+          if (verificationInProgress) {
+            log.info("Ignoring verification request — one already in progress");
+            return;
+          }
+
+          verificationInProgress = true;
+          log.info(`Incoming verification request from ${request.otherUserId}`);
+
+          try {
+            await request.accept();
+            await new Promise((r) => setTimeout(r, 1000));
+
+            let verifier;
+            try {
+              verifier = await request.startVerification("m.sas.v1");
+            } catch {
+              verifier = request.verifier;
+              if (!verifier) throw new Error("Could not obtain verifier");
+            }
+
+            verifier.on(VerifierEvent.ShowSas, (sasCallbacks: {
+              sas: { emoji?: Array<[string, string]>; decimal?: [number, number, number] };
+              confirm: () => Promise<void>;
+            }) => {
+              const emojis = sasCallbacks.sas?.emoji;
+              let emojiDisplay = "";
+              if (emojis) {
+                emojiDisplay = emojis.map(([emoji, name]) => `${emoji} ${name}`).join("  ");
+              }
+              log.info(`SAS emojis: ${emojiDisplay || "(none)"}`);
+
+              // Send emojis to all joined rooms so the user sees them
+              client.getJoinedRooms().then((resp) => {
+                for (const roomId of resp.joined_rooms) {
+                  client.sendMessage(roomId, {
+                    msgtype: MsgType.Notice,
+                    body: `Verification emojis:\n\n${emojiDisplay || "(no emojis)"}\n\n1. Check these match what Element shows\n2. Click "They match" in Element\n3. Then send "confirm" here`,
+                  }).catch(() => {});
+                }
+              }).catch(() => {});
+
+              pendingSasConfirm = sasCallbacks.confirm;
+            });
+
+            verifier.on(VerifierEvent.Cancel, () => {
+              log.info("Verification cancelled");
+            });
+
+            await verifier.verify();
+            log.info("Verification complete!");
+          } catch (err) {
+            log.warn(`Verification failed: ${err instanceof Error ? err.message : String(err)}`);
+          } finally {
+            verificationInProgress = false;
+          }
+        });
       }
     },
 
@@ -297,12 +374,28 @@ export async function createMatrixClient(
       log.info(`Left room ${roomId}`);
     },
 
+    hasPendingSasConfirm(): boolean {
+      return pendingSasConfirm !== null;
+    },
+
+    confirmSas(): void {
+      if (pendingSasConfirm) {
+        const confirm = pendingSasConfirm;
+        pendingSasConfirm = null;
+        confirm().catch((e) => log.error(`SAS confirm error: ${e}`));
+      }
+    },
+
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     on(event: string, handler: (...args: any[]) => void): void {
       switch (event) {
         case "room.message": {
           const processMessage = (matrixEvent: MatrixEventType): void => {
+            // Skip events from before initial sync (old history / late decryptions)
+            if (!initialSyncDone) return;
+            if (matrixEvent.getTs() < syncTimestamp) return;
             if (matrixEvent.getType() !== EventType.RoomMessage) return;
+            if (matrixEvent.isDecryptionFailure?.()) return;
             const roomId = matrixEvent.getRoomId();
             if (!roomId) return;
             handler(roomId, {

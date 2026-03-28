@@ -332,6 +332,18 @@ matrix.on("room.message", async (roomId: string, event: Record<string, unknown>)
 
   if (!msgtype) return;
 
+  // ── SAS verification confirm ──
+  if (matrix.hasPendingSasConfirm()) {
+    log.info("Pending SAS confirm — treating message as confirmation");
+    matrix.confirmSas();
+    return;
+  }
+
+  // ── Skip verification protocol messages ──
+  if (typeof msgtype === "string" && msgtype.startsWith("m.key.verification.")) {
+    return;
+  }
+
   // ── Text messages ──
   if (msgtype === "m.text") {
     const body = (content.body as string) ?? "";
