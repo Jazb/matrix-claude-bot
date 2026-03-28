@@ -25,6 +25,7 @@
   "dependencies": {
     "marked": "^17.0.4",
     "matrix-js-sdk": "^41.2.0",
+    "node-indexeddb": "^6.0.3",
     "ws": "^8.19.0"
   },
   "devDependencies": {

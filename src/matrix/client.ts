@@ -6,6 +6,20 @@
  * and provides a clean interface for the rest of the application.
  */
 
+// Register IndexedDB polyfill for Node.js with LevelDB persistence.
+// Must run before matrix-js-sdk import so the WASM crypto store can persist keys to disk.
+import { mkdirSync as _mkdirSync } from "fs";
+import { join as _join, resolve as _resolve } from "path";
+
+const _idbDir = _resolve(_join("data", "crypto-indexeddb"));
+_mkdirSync(_idbDir, { recursive: true, mode: 0o700 });
+const _origCwd = process.cwd();
+process.chdir(_idbDir);
+const { default: _dbManager } = await import("node-indexeddb/dbManager");
+await _dbManager.loadCache().catch(() => {});
+await import("node-indexeddb/auto");
+process.chdir(_origCwd);
+
 import {
   createClient,
   ClientEvent,
@@ -126,9 +140,12 @@ export async function createMatrixClient(
     userId,
 
     async start() {
-      // Initialize E2EE before starting sync
+      // Initialize E2EE with persistent IndexedDB-backed crypto store
       if (matrixConfig.enableE2ee) {
-        await client.initRustCrypto({ useIndexedDB: false });
+        await client.initRustCrypto({
+          useIndexedDB: true,
+          cryptoDatabasePrefix: "matrix-claude-bot-crypto",
+        });
       }
 
       await client.startClient({ initialSyncLimit: 0 } as IStartClientOpts);
