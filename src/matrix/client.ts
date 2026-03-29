@@ -34,7 +34,7 @@ import {
   type IStartClientOpts,
 } from "matrix-js-sdk";
 import { CryptoEvent, VerifierEvent } from "matrix-js-sdk/lib/crypto-api/index.js";
-import { writeFileSync, readFileSync, existsSync, mkdirSync } from "fs";
+import { writeFileSync, readFileSync, existsSync, mkdirSync, unlinkSync } from "fs";
 import { dirname, join } from "path";
 import { marked } from "marked";
 import { createDecipheriv } from "crypto";
@@ -250,7 +250,25 @@ export async function createMatrixClient(
                 }
               }).catch(() => {});
 
+              // Store confirm callback — user triggers via `npm run confirm-sas`
+              // which creates a trigger file that the bot watches
               pendingSasConfirm = sasCallbacks.confirm;
+              const triggerFile = join("data", "sas-confirm-trigger");
+              log.info(`Waiting for SAS confirm — run: npm run confirm-sas (or touch ${triggerFile})`);
+
+              // Poll for the trigger file
+              const pollInterval = setInterval(() => {
+                if (existsSync(triggerFile)) {
+                  clearInterval(pollInterval);
+                  try { unlinkSync(triggerFile); } catch {}
+                  if (pendingSasConfirm) {
+                    log.info("SAS confirm triggered via file");
+                    const confirm = pendingSasConfirm;
+                    pendingSasConfirm = null;
+                    confirm().catch((e) => log.error(`SAS confirm error: ${e}`));
+                  }
+                }
+              }, 500);
             });
 
             verifier.on(VerifierEvent.Cancel, (e: unknown) => {

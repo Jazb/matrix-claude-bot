@@ -11,7 +11,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint src/ tests/",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "confirm-sas": "touch data/sas-confirm-trigger && echo 'SAS confirm triggered'"
   },
   "keywords": [
     "matrix",
