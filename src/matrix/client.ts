@@ -76,6 +76,8 @@ export interface MatrixClientWrapper {
   downloadEncryptedMedia: (file: EncryptedFileInfo, destPath: string) => Promise<void>;
   getJoinedRooms: () => Promise<string[]>;
   leaveRoom: (roomId: string) => Promise<void>;
+  hasPendingSasConfirm: () => boolean;
+  confirmSas: () => void;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   on: (event: string, handler: (...args: any[]) => void) => void;
 }
@@ -135,6 +137,7 @@ export async function createMatrixClient(
 
   // SAS verification state
   let verificationInProgress = false;
+  let pendingSasConfirm: (() => Promise<void>) | null = null;
 
   const client: MatrixClient = createClient({
     baseUrl: matrixConfig.homeserverUrl,
@@ -169,83 +172,6 @@ export async function createMatrixClient(
           cryptoDatabasePrefix: "matrix-claude-bot-crypto",
         });
 
-        // Also listen on the crypto backend directly
-        const crypto = client.getCrypto();
-        if (crypto) {
-          (crypto as unknown as { on: (event: string, handler: (...args: unknown[]) => void) => void })
-            .on(CryptoEvent.VerificationRequestReceived, (request: unknown) => {
-              log.info(`[crypto-direct] Verification request received: ${JSON.stringify((request as { otherUserId?: string }).otherUserId)}`);
-            });
-        }
-
-        // Register SAS verification handler BEFORE startClient so we don't miss events
-        client.on(CryptoEvent.VerificationRequestReceived, async (request) => {
-          if (request.initiatedByMe) return;
-          if (verificationInProgress) {
-            log.info("Ignoring verification request — one already in progress");
-            return;
-          }
-
-          verificationInProgress = true;
-          log.info(`Incoming verification request from ${request.otherUserId}`);
-
-          try {
-            await request.accept();
-
-            // Wait for the other side to start the verification (don't start ourselves
-            // to avoid SAS mismatch from race conditions on verification.start)
-            let verifier = request.verifier;
-            if (!verifier) {
-              // Wait up to 30s for the other side to start
-              for (let i = 0; i < 60 && !request.verifier; i++) {
-                await new Promise((r) => setTimeout(r, 500));
-              }
-              verifier = request.verifier;
-              if (!verifier) throw new Error("Timed out waiting for verifier");
-            }
-
-            verifier.on(VerifierEvent.ShowSas, (sasCallbacks: {
-              sas: { emoji?: Array<[string, string]>; decimal?: [number, number, number] };
-              confirm: () => Promise<void>;
-            }) => {
-              const emojis = sasCallbacks.sas?.emoji;
-              let emojiDisplay = "";
-              if (emojis) {
-                emojiDisplay = emojis.map(([emoji, name]) => `${emoji} ${name}`).join("  ");
-              }
-              log.info(`SAS emojis: ${emojiDisplay || "(none)"}`);
-
-              // Send emojis to all joined rooms so the user sees them
-              client.getJoinedRooms().then((resp) => {
-                for (const roomId of resp.joined_rooms) {
-                  client.sendMessage(roomId, {
-                    msgtype: MsgType.Notice,
-                    body: `Verification emojis:\n\n${emojiDisplay || "(no emojis)"}\n\nClick "They match" in Element to complete verification.`,
-                  }).catch(() => {});
-                }
-              }).catch(() => {});
-
-              // Wait for the user to click "They match" in Element, then auto-confirm.
-              // We delay to give Element time to process — the SDK handles the MAC exchange.
-              log.info("Waiting 10s for user to confirm in Element, then auto-confirming...");
-              setTimeout(() => {
-                log.info("Auto-confirming SAS from bot side");
-                sasCallbacks.confirm().catch((e) => log.error(`SAS auto-confirm error: ${e}`));
-              }, 10000);
-            });
-
-            verifier.on(VerifierEvent.Cancel, () => {
-              log.info("Verification cancelled");
-            });
-
-            await verifier.verify();
-            log.info("Verification complete!");
-          } catch (err) {
-            log.warn(`Verification failed: ${err instanceof Error ? err.message : String(err)}`);
-          } finally {
-            verificationInProgress = false;
-          }
-        });
       }
 
       await client.startClient({ initialSyncLimit: 0 } as IStartClientOpts);
@@ -274,6 +200,71 @@ export async function createMatrixClient(
       // Bootstrap cross-signing and verify own device
       if (matrixConfig.enableE2ee) {
         await setupCrossSigning(client, userId, matrixConfig.password);
+
+        // Register SAS verification handler AFTER startClient (like matrix-channel)
+        client.on(CryptoEvent.VerificationRequestReceived, async (request) => {
+          if (request.initiatedByMe) return;
+          if (verificationInProgress) {
+            log.info("Ignoring verification request — one already in progress");
+            return;
+          }
+
+          verificationInProgress = true;
+          log.info(`Incoming verification request from ${request.otherUserId} phase=${request.phase}`);
+
+          try {
+            await request.accept();
+            log.info("Verification accepted");
+
+            await new Promise((r) => setTimeout(r, 1000));
+
+            // Start SAS — same pattern as matrix-channel
+            let verifier;
+            try {
+              verifier = await request.startVerification("m.sas.v1");
+            } catch (err) {
+              log.info(`startVerification failed: ${err}, checking for existing verifier...`);
+              verifier = request.verifier;
+              if (!verifier) throw err;
+            }
+            log.info("Verifier obtained, calling verify()...");
+
+            verifier.on(VerifierEvent.ShowSas, (sasCallbacks: {
+              sas: { emoji?: Array<[string, string]>; decimal?: [number, number, number] };
+              confirm: () => Promise<void>;
+            }) => {
+              const emojis = sasCallbacks.sas?.emoji;
+              let emojiDisplay = "";
+              if (emojis) {
+                emojiDisplay = emojis.map(([emoji, name]) => `${emoji} ${name}`).join("  ");
+              }
+              log.info(`SAS emojis: ${emojiDisplay || "(none)"}`);
+
+              // Send emojis to all joined rooms
+              client.getJoinedRooms().then((resp) => {
+                for (const roomId of resp.joined_rooms) {
+                  client.sendMessage(roomId, {
+                    msgtype: MsgType.Notice,
+                    body: `Verification emojis:\n\n${emojiDisplay || "(no emojis)"}\n\nClick "They match" in Element, then send "confirm" here.`,
+                  }).catch(() => {});
+                }
+              }).catch(() => {});
+
+              pendingSasConfirm = sasCallbacks.confirm;
+            });
+
+            verifier.on(VerifierEvent.Cancel, (e: unknown) => {
+              log.info(`Verification cancelled: ${e}`);
+            });
+
+            await verifier.verify();
+            log.info("Verification complete!");
+          } catch (err) {
+            log.warn(`Verification failed: ${err instanceof Error ? err.message : String(err)}`);
+          } finally {
+            verificationInProgress = false;
+          }
+        });
       }
     },
 
@@ -395,6 +386,18 @@ export async function createMatrixClient(
     async leaveRoom(roomId: string): Promise<void> {
       await client.leave(roomId);
       log.info(`Left room ${roomId}`);
+    },
+
+    hasPendingSasConfirm(): boolean {
+      return pendingSasConfirm !== null;
+    },
+
+    confirmSas(): void {
+      if (pendingSasConfirm) {
+        const confirm = pendingSasConfirm;
+        pendingSasConfirm = null;
+        confirm().catch((e) => log.error(`SAS confirm error: ${e}`));
+      }
     },
 
 
