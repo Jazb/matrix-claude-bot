@@ -201,9 +201,16 @@ export async function createMatrixClient(
       if (matrixConfig.enableE2ee) {
         await setupCrossSigning(client, userId, matrixConfig.password);
 
+        // Wait for old verification events from sync to settle before accepting new ones
+        const verificationReadyAfter = Date.now() + 10000;
+
         // Register SAS verification handler AFTER startClient (like matrix-channel)
         client.on(CryptoEvent.VerificationRequestReceived, async (request) => {
           if (request.initiatedByMe) return;
+          if (Date.now() < verificationReadyAfter) {
+            log.info(`Ignoring verification from ${request.otherUserId} — still settling after startup`);
+            return;
+          }
           if (verificationInProgress) {
             log.info("Ignoring verification request — one already in progress");
             return;
