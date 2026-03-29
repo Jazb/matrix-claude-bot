@@ -169,6 +169,15 @@ export async function createMatrixClient(
           cryptoDatabasePrefix: "matrix-claude-bot-crypto",
         });
 
+        // Also listen on the crypto backend directly
+        const crypto = client.getCrypto();
+        if (crypto) {
+          (crypto as unknown as { on: (event: string, handler: (...args: unknown[]) => void) => void })
+            .on(CryptoEvent.VerificationRequestReceived, (request: unknown) => {
+              log.info(`[crypto-direct] Verification request received: ${JSON.stringify((request as { otherUserId?: string }).otherUserId)}`);
+            });
+        }
+
         // Register SAS verification handler BEFORE startClient so we don't miss events
         client.on(CryptoEvent.VerificationRequestReceived, async (request) => {
           if (request.initiatedByMe) return;
