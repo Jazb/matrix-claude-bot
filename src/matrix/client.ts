@@ -213,9 +213,13 @@ export async function createMatrixClient(
                 }
               }).catch(() => {});
 
-              // Auto-confirm from the bot side — the user only needs to confirm in Element
-              log.info("Auto-confirming SAS from bot side");
-              sasCallbacks.confirm().catch((e) => log.error(`SAS auto-confirm error: ${e}`));
+              // Wait for the user to click "They match" in Element, then auto-confirm.
+              // We delay to give Element time to process — the SDK handles the MAC exchange.
+              log.info("Waiting 10s for user to confirm in Element, then auto-confirming...");
+              setTimeout(() => {
+                log.info("Auto-confirming SAS from bot side");
+                sasCallbacks.confirm().catch((e) => log.error(`SAS auto-confirm error: ${e}`));
+              }, 10000);
             });
 
             verifier.on(VerifierEvent.Cancel, () => {
