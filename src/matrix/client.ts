@@ -171,7 +171,6 @@ export async function createMatrixClient(
           useIndexedDB: true,
           cryptoDatabasePrefix: "matrix-claude-bot-crypto",
         });
-
       }
 
       await client.startClient({ initialSyncLimit: 0 } as IStartClientOpts);
