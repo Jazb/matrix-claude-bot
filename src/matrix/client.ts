@@ -182,14 +182,17 @@ export async function createMatrixClient(
 
           try {
             await request.accept();
-            await new Promise((r) => setTimeout(r, 1000));
 
-            let verifier;
-            try {
-              verifier = await request.startVerification("m.sas.v1");
-            } catch {
+            // Wait for the other side to start the verification (don't start ourselves
+            // to avoid SAS mismatch from race conditions on verification.start)
+            let verifier = request.verifier;
+            if (!verifier) {
+              // Wait up to 30s for the other side to start
+              for (let i = 0; i < 60 && !request.verifier; i++) {
+                await new Promise((r) => setTimeout(r, 500));
+              }
               verifier = request.verifier;
-              if (!verifier) throw new Error("Could not obtain verifier");
+              if (!verifier) throw new Error("Timed out waiting for verifier");
             }
 
             verifier.on(VerifierEvent.ShowSas, (sasCallbacks: {
