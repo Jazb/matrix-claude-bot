@@ -76,8 +76,6 @@ export interface MatrixClientWrapper {
   downloadEncryptedMedia: (file: EncryptedFileInfo, destPath: string) => Promise<void>;
   getJoinedRooms: () => Promise<string[]>;
   leaveRoom: (roomId: string) => Promise<void>;
-  hasPendingSasConfirm: () => boolean;
-  confirmSas: () => void;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   on: (event: string, handler: (...args: any[]) => void) => void;
 }
@@ -137,7 +135,6 @@ export async function createMatrixClient(
 
   // SAS verification state
   let verificationInProgress = false;
-  let pendingSasConfirm: (() => Promise<void>) | null = null;
 
   const client: MatrixClient = createClient({
     baseUrl: matrixConfig.homeserverUrl,
@@ -211,12 +208,14 @@ export async function createMatrixClient(
                 for (const roomId of resp.joined_rooms) {
                   client.sendMessage(roomId, {
                     msgtype: MsgType.Notice,
-                    body: `Verification emojis:\n\n${emojiDisplay || "(no emojis)"}\n\n1. Check these match what Element shows\n2. Click "They match" in Element\n3. Then send "confirm" here`,
+                    body: `Verification emojis:\n\n${emojiDisplay || "(no emojis)"}\n\nClick "They match" in Element to complete verification.`,
                   }).catch(() => {});
                 }
               }).catch(() => {});
 
-              pendingSasConfirm = sasCallbacks.confirm;
+              // Auto-confirm from the bot side — the user only needs to confirm in Element
+              log.info("Auto-confirming SAS from bot side");
+              sasCallbacks.confirm().catch((e) => log.error(`SAS auto-confirm error: ${e}`));
             });
 
             verifier.on(VerifierEvent.Cancel, () => {
@@ -382,17 +381,6 @@ export async function createMatrixClient(
       log.info(`Left room ${roomId}`);
     },
 
-    hasPendingSasConfirm(): boolean {
-      return pendingSasConfirm !== null;
-    },
-
-    confirmSas(): void {
-      if (pendingSasConfirm) {
-        const confirm = pendingSasConfirm;
-        pendingSasConfirm = null;
-        confirm().catch((e) => log.error(`SAS confirm error: ${e}`));
-      }
-    },
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     on(event: string, handler: (...args: any[]) => void): void {
@@ -417,7 +405,6 @@ export async function createMatrixClient(
           client.on(RoomEvent.Timeline, (matrixEvent, _room, toStartOfTimeline) => {
             if (toStartOfTimeline) return;
             if (matrixEvent.isEncrypted()) return;
-            log.debug(`[msg-handler] Unencrypted event: type=${matrixEvent.getType()} sender=${matrixEvent.getSender()}`);
             processMessage(matrixEvent);
           });
 
@@ -425,22 +412,16 @@ export async function createMatrixClient(
           client.on(RoomEvent.Timeline, (matrixEvent, _room, toStartOfTimeline) => {
             if (toStartOfTimeline) return;
             if (!matrixEvent.isEncrypted()) return;
-
-            log.debug(`[msg-handler] Encrypted event: type=${matrixEvent.getType()} sender=${matrixEvent.getSender()} decryptionFailure=${matrixEvent.isDecryptionFailure?.()} beingDecrypted=${matrixEvent.isBeingDecrypted()}`);
-
             if (matrixEvent.isDecryptionFailure?.()) return;
 
             // If already decrypted (keys were available), process immediately
             if (matrixEvent.getType() === EventType.RoomMessage) {
-              log.debug(`[msg-handler] Already decrypted, processing`);
               processMessage(matrixEvent);
               return;
             }
 
             // Otherwise wait for the decryption event
-            log.debug(`[msg-handler] Waiting for decryption...`);
             matrixEvent.once(MatrixEventEvent.Decrypted, () => {
-              log.debug(`[msg-handler] Decrypted: type=${matrixEvent.getType()} sender=${matrixEvent.getSender()} failure=${matrixEvent.isDecryptionFailure?.()}`);
               processMessage(matrixEvent);
             });
           });

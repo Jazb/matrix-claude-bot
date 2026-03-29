@@ -305,24 +305,15 @@ async function handlePrompt(roomId: string, prompt: string): Promise<void> {
 
 // ─── Event handlers ──────────────────────────────────────────────────────────
 
-matrix.on("room.event", (roomId: string, event: Record<string, unknown>) => {
-  log.debug(`[room.event] room=${roomId} type=${event.type} sender=${event.sender}`);
-});
-
 matrix.on("room.join", (roomId: string) => {
-  log.info(`[room.join] Joined room ${roomId}`);
+  log.info(`Joined room ${roomId}`);
 });
 
 matrix.on("room.failed_decryption", (roomId: string, event: Record<string, unknown>, error: Error) => {
-  log.error(`[E2EE] Failed to decrypt event in ${roomId} from ${event.sender}: ${error.message}`);
-});
-
-matrix.on("room.decrypted_event", (roomId: string, event: Record<string, unknown>) => {
-  log.debug(`[E2EE] Decrypted event in ${roomId} type=${event.type} from ${event.sender}`);
+  log.error(`Failed to decrypt event in ${roomId} from ${event.sender}: ${error.message}`);
 });
 
 matrix.on("room.message", async (roomId: string, event: Record<string, unknown>) => {
-  log.debug(`[room.message] room=${roomId} sender=${event.sender} type=${(event.content as Record<string, unknown>)?.msgtype}`);
 
   if (event.sender === matrix.userId) return;
   if (!isAllowed(event.sender as string)) return;
@@ -331,13 +322,6 @@ matrix.on("room.message", async (roomId: string, event: Record<string, unknown>)
   const msgtype = content?.msgtype as string | undefined;
 
   if (!msgtype) return;
-
-  // ── SAS verification confirm ──
-  if (matrix.hasPendingSasConfirm()) {
-    log.info("Pending SAS confirm — treating message as confirmation");
-    matrix.confirmSas();
-    return;
-  }
 
   // ── Skip verification protocol messages ──
   if (typeof msgtype === "string" && msgtype.startsWith("m.key.verification.")) {

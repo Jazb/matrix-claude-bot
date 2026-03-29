@@ -75,7 +75,7 @@ export function loadConfig(): AppConfig {
       maxTurns: Number(optional("CLAUDE_MAX_TURNS", "25")),
     },
     groq: {
-      apiKey: required("GROQ_API_KEY"),
+      apiKey: optional("GROQ_API_KEY", ""),
       model: optional("GROQ_MODEL", "whisper-large-v3-turbo"),
       endpoint: optional("GROQ_ENDPOINT", "https://api.groq.com/openai/v1/audio/transcriptions"),
       language: optional("GROQ_LANGUAGE", "auto"),
