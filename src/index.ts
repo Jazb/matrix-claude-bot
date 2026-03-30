@@ -30,6 +30,7 @@ import { SerialQueue } from "./queue/index.js";
 import { BridgeRunner } from "./bridge/index.js";
 import { IdeRunner } from "./ide/index.js";
 import { splitMessage, createLogger, setLogLevel } from "./utils/index.js";
+import { startHealthServer } from "./health/index.js";
 
 const log = createLogger("bot");
 
@@ -485,6 +486,12 @@ async function downloadContentToFile(
   } else {
     throw new Error("No media URL in message (neither content.url nor content.file found)");
   }
+}
+
+// ─── Health check ───────────────────────────────────────────────────────────
+
+if (config.bot.healthPort > 0) {
+  startHealthServer(config.bot.healthPort, matrix);
 }
 
 // ─── Start ───────────────────────────────────────────────────────────────────

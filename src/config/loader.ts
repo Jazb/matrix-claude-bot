@@ -85,6 +85,7 @@ export function loadConfig(): AppConfig {
       tmpDir: optional("TMP_DIR", "/tmp/matrix-claude-bot"),
       sessionsFile: optional("SESSIONS_FILE", "./data/sessions.json"),
       logLevel: optional("LOG_LEVEL", "info"),
+      healthPort: Number(optional("HEALTH_PORT", "8081")),
     },
     bridge: {
       mode: (optional("BOT_MODE", "bot") as "bot" | "bridge" | "ide"),

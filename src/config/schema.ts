@@ -70,6 +70,8 @@ export interface BotConfig {
   sessionsFile: string;
   /** Log level: "debug" | "info" | "warn" | "error" */
   logLevel: string;
+  /** Port for HTTP health check endpoint (0 = disabled) */
+  healthPort: number;
 }
 
 // -- Bridge mode --

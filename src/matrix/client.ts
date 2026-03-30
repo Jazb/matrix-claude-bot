@@ -78,6 +78,8 @@ export interface MatrixClientWrapper {
   leaveRoom: (roomId: string) => Promise<void>;
   hasPendingSasConfirm: () => boolean;
   confirmSas: () => void;
+  /** Whether the Matrix client is currently syncing (healthy). */
+  isSyncing: () => boolean;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   on: (event: string, handler: (...args: any[]) => void) => void;
 }
@@ -113,14 +115,34 @@ export async function createMatrixClient(
     mkdirSync(storageDir, { recursive: true });
   }
 
-  // Resolve userId via whoami before creating the full client
-  const whoamiResp = await fetch(`${matrixConfig.homeserverUrl}/_matrix/client/v3/account/whoami`, {
-    headers: { Authorization: `Bearer ${matrixConfig.accessToken}` },
-  });
-  if (!whoamiResp.ok) {
-    throw new Error("Failed to authenticate with Matrix homeserver. Check MATRIX_ACCESS_TOKEN.");
+  // Resolve userId via whoami with retry — network may not be available at boot
+  let whoami: { user_id: string; device_id?: string };
+  {
+    const MAX_RETRIES = 30;
+    const BASE_DELAY = 2000;
+    const MAX_DELAY = 60000;
+
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const whoamiResp = await fetch(`${matrixConfig.homeserverUrl}/_matrix/client/v3/account/whoami`, {
+          headers: { Authorization: `Bearer ${matrixConfig.accessToken}` },
+        });
+        if (!whoamiResp.ok) {
+          throw new Error(`HTTP ${whoamiResp.status}: ${whoamiResp.statusText}`);
+        }
+        whoami = (await whoamiResp.json()) as { user_id: string; device_id?: string };
+        break;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (attempt >= MAX_RETRIES) {
+          throw new Error(`Failed to authenticate with Matrix homeserver after ${MAX_RETRIES} attempts: ${msg}`);
+        }
+        const delay = Math.min(BASE_DELAY * Math.pow(1.5, attempt - 1), MAX_DELAY);
+        log.warn(`Homeserver unreachable (attempt ${attempt}/${MAX_RETRIES}): ${msg} — retrying in ${Math.round(delay / 1000)}s`);
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
   }
-  const whoami = (await whoamiResp.json()) as { user_id: string; device_id?: string };
   const userId = whoami.user_id;
   log.info(`Authenticated as ${userId}`);
 
@@ -134,6 +156,7 @@ export async function createMatrixClient(
   // Track sync state to filter old events on startup
   let initialSyncDone = false;
   let syncTimestamp = 0;
+  let lastSyncOk = 0; // timestamp of last successful sync
 
   // SAS verification state
   let verificationInProgress = false;
@@ -186,6 +209,15 @@ export async function createMatrixClient(
           }
         };
         client.on(ClientEvent.Sync, onSync);
+      });
+
+      lastSyncOk = Date.now();
+
+      // Track ongoing sync health
+      client.on(ClientEvent.Sync, (state: string) => {
+        if (state === "SYNCING" || state === "PREPARED") {
+          lastSyncOk = Date.now();
+        }
       });
 
       log.info("Matrix sync started" + (matrixConfig.enableE2ee ? " (E2EE active)" : ""));
@@ -410,6 +442,12 @@ export async function createMatrixClient(
     async leaveRoom(roomId: string): Promise<void> {
       await client.leave(roomId);
       log.info(`Left room ${roomId}`);
+    },
+
+    isSyncing(): boolean {
+      if (!initialSyncDone) return false;
+      // Consider unhealthy if no successful sync in the last 5 minutes
+      return (Date.now() - lastSyncOk) < 300_000;
     },
 
     hasPendingSasConfirm(): boolean {
