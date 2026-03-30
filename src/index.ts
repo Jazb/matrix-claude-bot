@@ -118,15 +118,22 @@ const COMMANDS: Record<string, (roomId: string, args: string) => Promise<void>> 
     }
 
     if (mode === "bridge") {
-      await bridge!.newSession(roomId);
+      // Switch project and start tmux session immediately
+      await bridge!.switchProject(roomId, name);
     } else if (mode === "ide") {
       await ide!.newSession(roomId);
+      sessions.set(roomId, { project: name, sessionId: null });
+      await matrix.sendNotice(
+        roomId,
+        `Project: ${name}\nDirectory: ${config.projects.projects[name]}\nSession reset.`,
+      );
+    } else {
+      sessions.set(roomId, { project: name, sessionId: null });
+      await matrix.sendNotice(
+        roomId,
+        `Project: ${name}\nDirectory: ${config.projects.projects[name]}\nSession reset.`,
+      );
     }
-    sessions.set(roomId, { project: name, sessionId: null });
-    await matrix.sendNotice(
-      roomId,
-      `Project: ${name}\nDirectory: ${config.projects.projects[name]}\nSession reset.`,
-    );
   },
 
   "!status": async (roomId) => {
@@ -485,19 +492,18 @@ async function downloadContentToFile(
 await matrix.start();
 log.info(`Matrix Claude Bot started (${mode} mode)`);
 
-// Pre-start Claude sessions in bridge mode so the first message is instant
+// Pre-start all project windows in bridge mode
 if (mode === "bridge" && bridge) {
+  try {
+    await bridge.warmupAll();
+  } catch (err) {
+    log.error(`Bridge warmup failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // Register joined rooms so hook responses route correctly
   const joinedRooms = await matrix.getJoinedRooms();
   for (const roomId of joinedRooms) {
-    bridge.warmup(roomId).catch(async (err) => {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes("M_FORBIDDEN")) {
-        log.warn(`No permission in ${roomId}, leaving room`);
-        await matrix.leaveRoom(roomId).catch(() => {});
-      } else {
-        log.warn(`Warmup failed for ${roomId}: ${msg}`);
-      }
-    });
+    bridge.registerRoom(roomId);
   }
 }
 
