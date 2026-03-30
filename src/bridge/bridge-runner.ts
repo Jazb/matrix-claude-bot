@@ -20,6 +20,7 @@ import { marked } from "marked";
 import type { AppConfig } from "../config/schema.js";
 import type { MatrixClientWrapper } from "../matrix/client.js";
 import { SessionStore } from "../claude/session.js";
+import { buildPermissionArgs, resolvePermission } from "../claude/permission-args.js";
 import { IPCServer, type HookPayload } from "./ipc-server.js";
 import { TmuxManager } from "./tmux-manager.js";
 import { generateHooksSettings } from "./hook-injector.js";
@@ -63,15 +64,18 @@ export class BridgeRunner {
   async warmupAll(): Promise<void> {
     const projects = this.config.projects.projects;
 
-    for (const [projectName, cwd] of Object.entries(projects)) {
+    for (const [projectName, entry] of Object.entries(projects)) {
       if (this.tmux.isAlive(projectName)) continue;
 
-      log.info(`Starting window for project "${projectName}" (cwd: ${cwd})`);
+      const perm = resolvePermission(this.config.projects, projectName);
+      const permArgs = buildPermissionArgs(perm);
+
+      log.info(`Starting window for project "${projectName}" (cwd: ${entry.path})`);
       this.tmux.startWindow(
         projectName,
-        cwd,
+        entry.path,
         this.config.claude.binaryPath,
-        this.config.bridge.claudeArgs,
+        [...permArgs, ...this.config.bridge.claudeArgs],
         this.settingsJson,
       );
       await this.waitForReady(projectName);
@@ -99,14 +103,15 @@ export class BridgeRunner {
 
     // Ensure the window is alive, restart if dead
     if (!this.tmux.isAlive(project)) {
-      const cwd = this.config.projects.projects[project];
-      if (!cwd) throw new Error(`Unknown project "${project}"`);
+      const entry = this.config.projects.projects[project];
+      if (!entry) throw new Error(`Unknown project "${project}"`);
 
+      const perm = resolvePermission(this.config.projects, project);
       this.tmux.startWindow(
         project,
-        cwd,
+        entry.path,
         this.config.claude.binaryPath,
-        this.config.bridge.claudeArgs,
+        [...buildPermissionArgs(perm), ...this.config.bridge.claudeArgs],
         this.settingsJson,
       );
       await this.waitForReady(project);
@@ -132,14 +137,15 @@ export class BridgeRunner {
     this.tmux.killWindow(project);
     this.sessions.clear(roomId);
 
-    const cwd = this.config.projects.projects[project];
-    if (!cwd) throw new Error(`Unknown project "${project}"`);
+    const entry = this.config.projects.projects[project];
+    if (!entry) throw new Error(`Unknown project "${project}"`);
 
+    const perm = resolvePermission(this.config.projects, project);
     this.tmux.startWindow(
       project,
-      cwd,
+      entry.path,
       this.config.claude.binaryPath,
-      this.config.bridge.claudeArgs,
+      [...buildPermissionArgs(perm), ...this.config.bridge.claudeArgs],
       this.settingsJson,
     );
     await this.waitForReady(project);
@@ -150,8 +156,8 @@ export class BridgeRunner {
    * (created at warmup), so this just updates the mapping.
    */
   async switchProject(roomId: string, project: string): Promise<void> {
-    const cwd = this.config.projects.projects[project];
-    if (!cwd) throw new Error(`Unknown project "${project}"`);
+    const entry = this.config.projects.projects[project];
+    if (!entry) throw new Error(`Unknown project "${project}"`);
 
     // Update session mapping
     this.sessions.set(roomId, { project, sessionId: null });
@@ -159,11 +165,12 @@ export class BridgeRunner {
 
     // Ensure the window is alive
     if (!this.tmux.isAlive(project)) {
+      const perm = resolvePermission(this.config.projects, project);
       this.tmux.startWindow(
         project,
-        cwd,
+        entry.path,
         this.config.claude.binaryPath,
-        this.config.bridge.claudeArgs,
+        [...buildPermissionArgs(perm), ...this.config.bridge.claudeArgs],
         this.settingsJson,
       );
       await this.waitForReady(project);
@@ -171,7 +178,7 @@ export class BridgeRunner {
 
     await this.matrix.sendNotice(
       roomId,
-      `Switched to project: ${project}\nDirectory: ${cwd}`,
+      `Switched to project: ${project}\nDirectory: ${entry.path}`,
     );
   }
 

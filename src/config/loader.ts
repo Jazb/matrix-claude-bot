@@ -3,15 +3,24 @@
  *
  * Required env vars:
  *   MATRIX_HOMESERVER_URL, MATRIX_ACCESS_TOKEN, MATRIX_ALLOWED_USER_ID,
- *   PROJECTS (comma-separated "name=/path" pairs), GROQ_API_KEY
+ *   PROJECTS (comma-separated entries), GROQ_API_KEY
  *
  * Optional env vars (with defaults):
- *   DEFAULT_PROJECT, CLAUDE_BINARY_PATH, CLAUDE_TIMEOUT, CLAUDE_MAX_TURNS,
- *   GROQ_MODEL, GROQ_ENDPOINT, GROQ_LANGUAGE, MAX_MESSAGE_LENGTH,
- *   TMP_DIR, SESSIONS_FILE, LOG_LEVEL
+ *   DEFAULT_PROJECT, PERMISSION_MODE, CLAUDE_BINARY_PATH, CLAUDE_TIMEOUT,
+ *   CLAUDE_MAX_TURNS, GROQ_MODEL, GROQ_ENDPOINT, GROQ_LANGUAGE,
+ *   MAX_MESSAGE_LENGTH, TMP_DIR, SESSIONS_FILE, LOG_LEVEL
+ *
+ * PROJECTS format:
+ *   Simple:          "myproject=/home/user/project"
+ *   With permission: "myproject=/home/user/project:bypassPermissions"
+ *   Mixed:           "safe=/home/safe,dangerous=/home/dev:bypassPermissions"
  */
 
-import type { AppConfig } from "./schema.js";
+import type { AppConfig, PermissionConfig, PermissionMode, ProjectEntry } from "./schema.js";
+
+const VALID_PERMISSION_MODES: PermissionMode[] = [
+  "default", "acceptEdits", "plan", "auto", "bypassPermissions",
+];
 
 function required(name: string): string {
   const value = process.env[name];
@@ -26,24 +35,76 @@ function optional(name: string, fallback: string): string {
   return process.env[name] || fallback;
 }
 
-function parseProjects(raw: string): Record<string, string> {
-  const projects: Record<string, string> = {};
+/**
+ * Parse a permission mode string into a PermissionConfig.
+ *
+ * Accepts:
+ *   "default", "acceptEdits", "plan", "auto", "bypassPermissions"
+ *   "allowedTools:Bash(npm *),Edit,Read"
+ */
+export function parsePermissionMode(raw: string): PermissionConfig {
+  const trimmed = raw.trim();
+
+  if (trimmed.startsWith("allowedTools:")) {
+    const tools = trimmed.slice("allowedTools:".length).split(";").map(t => t.trim()).filter(Boolean);
+    return { mode: "default", allowedTools: tools };
+  }
+
+  if (!VALID_PERMISSION_MODES.includes(trimmed as PermissionMode)) {
+    throw new Error(
+      `Invalid permission mode "${trimmed}". Valid: ${VALID_PERMISSION_MODES.join(", ")}, or "allowedTools:..."`,
+    );
+  }
+
+  return { mode: trimmed as PermissionMode, allowedTools: [] };
+}
+
+/**
+ * Parse PROJECTS env var.
+ *
+ * Format: "name=/path[:permissionMode],name2=/path2[:permissionMode]"
+ * The permission mode suffix is optional per project.
+ */
+function parseProjects(raw: string): Record<string, ProjectEntry> {
+  const projects: Record<string, ProjectEntry> = {};
+
   for (const pair of raw.split(",")) {
     const trimmed = pair.trim();
     if (!trimmed) continue;
+
     const eqIndex = trimmed.indexOf("=");
     if (eqIndex === -1) {
-      console.error(`[CONFIG] Invalid PROJECTS entry (expected "name=/path"): ${trimmed}`);
+      console.error(`[CONFIG] Invalid PROJECTS entry (expected "name=/path[:mode]"): ${trimmed}`);
       process.exit(1);
     }
+
     const name = trimmed.slice(0, eqIndex).trim().toLowerCase();
-    const path = trimmed.slice(eqIndex + 1).trim();
-    projects[name] = path;
+    const rest = trimmed.slice(eqIndex + 1).trim();
+
+    // Check for permission mode suffix — last colon-separated segment
+    // Must be careful: paths can contain colons on some systems, but permission
+    // mode values are a known set, so we check from the right.
+    const lastColon = rest.lastIndexOf(":");
+    let path = rest;
+    let permission: PermissionConfig | null = null;
+
+    if (lastColon > 0) {
+      const maybePerm = rest.slice(lastColon + 1);
+      // Check if the suffix looks like a permission mode
+      if (VALID_PERMISSION_MODES.includes(maybePerm as PermissionMode) || maybePerm.startsWith("allowedTools:")) {
+        path = rest.slice(0, lastColon);
+        permission = parsePermissionMode(maybePerm);
+      }
+    }
+
+    projects[name] = { path, permission };
   }
+
   if (Object.keys(projects).length === 0) {
     console.error("[CONFIG] PROJECTS must contain at least one entry");
     process.exit(1);
   }
+
   return projects;
 }
 
@@ -55,6 +116,8 @@ export function loadConfig(): AppConfig {
     console.error(`[CONFIG] DEFAULT_PROJECT "${defaultProject}" not found in PROJECTS`);
     process.exit(1);
   }
+
+  const defaultPermission = parsePermissionMode(optional("PERMISSION_MODE", "default"));
 
   return {
     matrix: {
@@ -68,6 +131,7 @@ export function loadConfig(): AppConfig {
     projects: {
       projects,
       defaultProject,
+      defaultPermission,
     },
     claude: {
       binaryPath: optional("CLAUDE_BINARY_PATH", "/usr/bin/claude"),

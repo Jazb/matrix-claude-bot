@@ -24,7 +24,8 @@ import { existsSync, mkdirSync } from "fs";
 import { join } from "path";
 import { loadConfig } from "./config/index.js";
 import { createMatrixClient, type EncryptedFileInfo } from "./matrix/index.js";
-import { ClaudeRunner, SessionStore } from "./claude/index.js";
+import { ClaudeRunner, SessionStore, resolvePermission, permissionLabel } from "./claude/index.js";
+import { parsePermissionMode } from "./config/index.js";
 import { GroqTranscriber } from "./transcriber/index.js";
 import { SerialQueue } from "./queue/index.js";
 import { BridgeRunner } from "./bridge/index.js";
@@ -104,7 +105,7 @@ const COMMANDS: Record<string, (roomId: string, args: string) => Promise<void>> 
     const session = sessions.get(roomId);
     const active = session?.project ?? config.projects.defaultProject;
     const lines = Object.entries(config.projects.projects).map(
-      ([name, path]) => `${name === active ? "▸" : " "} ${name} → ${path}`,
+      ([name, entry]) => `${name === active ? "▸" : " "} ${name} → ${entry.path}`,
     );
     lines.unshift("Projects:");
     await matrix.sendNotice(roomId, lines.join("\n"));
@@ -112,7 +113,7 @@ const COMMANDS: Record<string, (roomId: string, args: string) => Promise<void>> 
 
   "!project": async (roomId, args) => {
     const name = args.trim().toLowerCase();
-    if (!name || !config.projects.projects[name]) {
+    if (!name || !config.projects.projects[name]?.path) {
       const available = Object.keys(config.projects.projects).join(", ");
       await matrix.sendNotice(roomId, `Unknown project. Available: ${available}`);
       return;
@@ -126,13 +127,13 @@ const COMMANDS: Record<string, (roomId: string, args: string) => Promise<void>> 
       sessions.set(roomId, { project: name, sessionId: null });
       await matrix.sendNotice(
         roomId,
-        `Project: ${name}\nDirectory: ${config.projects.projects[name]}\nSession reset.`,
+        `Project: ${name}\nDirectory: ${config.projects.projects[name]?.path}\nSession reset.`,
       );
     } else {
       sessions.set(roomId, { project: name, sessionId: null });
       await matrix.sendNotice(
         roomId,
-        `Project: ${name}\nDirectory: ${config.projects.projects[name]}\nSession reset.`,
+        `Project: ${name}\nDirectory: ${config.projects.projects[name]?.path}\nSession reset.`,
       );
     }
   },
@@ -140,13 +141,15 @@ const COMMANDS: Record<string, (roomId: string, args: string) => Promise<void>> 
   "!status": async (roomId) => {
     const session = sessions.get(roomId);
     const project = session?.project ?? config.projects.defaultProject;
+    const perm = resolvePermission(config.projects, project, session?.permissionOverride);
 
     if (mode === "bridge") {
       const status = bridge!.getStatus(roomId);
       const lines = [
         `Mode: bridge (tmux + hooks)`,
         `Project: ${project}`,
-        `Directory: ${config.projects.projects[project]}`,
+        `Directory: ${config.projects.projects[project]?.path}`,
+        `Permission: ${permissionLabel(perm)}`,
         `Session alive: ${status.alive ? "Yes" : "No"}`,
         `Transcriber: ${transcriber.available ? "Groq OK" : "Not configured"}`,
       ];
@@ -159,7 +162,8 @@ const COMMANDS: Record<string, (roomId: string, args: string) => Promise<void>> 
       const lines = [
         `Mode: ide (MCP WebSocket)`,
         `Project: ${project}`,
-        `Directory: ${config.projects.projects[project]}`,
+        `Directory: ${config.projects.projects[project]?.path}`,
+        `Permission: ${permissionLabel(perm)}`,
         `Claude process: ${status.alive ? "Running" : "Stopped"}`,
         `MCP connected: ${status.connected ? "Yes" : "No"}`,
         `Transcriber: ${transcriber.available ? "Groq OK" : "Not configured"}`,
@@ -169,7 +173,8 @@ const COMMANDS: Record<string, (roomId: string, args: string) => Promise<void>> 
       const lines = [
         `Mode: bot (one-shot subprocess)`,
         `Project: ${project}`,
-        `Directory: ${config.projects.projects[project]}`,
+        `Directory: ${config.projects.projects[project]?.path}`,
+        `Permission: ${permissionLabel(perm)}`,
         `Active session: ${session?.sessionId ? "Yes" : "No"}`,
         `Processing: ${queue!.busy ? "Yes" : "No"}`,
         `Queue: ${queue!.length} pending`,
@@ -201,6 +206,48 @@ const COMMANDS: Record<string, (roomId: string, args: string) => Promise<void>> 
     }
   },
 
+  "!permission": async (roomId, args) => {
+    const session = sessions.get(roomId);
+    const project = session?.project ?? config.projects.defaultProject;
+
+    if (!args.trim()) {
+      // Show current permission mode
+      const perm = resolvePermission(config.projects, project, session?.permissionOverride);
+      const source = session?.permissionOverride ? "session override" :
+        config.projects.projects[project]?.permission ? "project config" : "global default";
+      await matrix.sendNotice(roomId,
+        `Permission mode: ${permissionLabel(perm)} (${source})\n\n` +
+        `Available modes: default, acceptEdits, plan, auto, bypassPermissions\n` +
+        `Or: allowedTools:Bash(npm *);Edit;Read\n` +
+        `Use "!permission reset" to clear session override.`,
+      );
+      return;
+    }
+
+    if (args.trim() === "reset") {
+      sessions.set(roomId, { ...session, permissionOverride: null } as { project: string; sessionId: string | null; permissionOverride: null });
+      const perm = resolvePermission(config.projects, project);
+      await matrix.sendNotice(roomId, `Permission reset to: ${permissionLabel(perm)}`);
+      if (mode === "bridge") {
+        await matrix.sendNotice(roomId, "Note: bridge mode requires !new to apply changes.");
+      }
+      return;
+    }
+
+    try {
+      const perm = parsePermissionMode(args.trim());
+      sessions.set(roomId, { ...session, project, sessionId: session?.sessionId ?? null, permissionOverride: perm });
+      await matrix.sendNotice(roomId, `Permission mode set: ${permissionLabel(perm)}`);
+      if (mode === "bridge") {
+        await matrix.sendNotice(roomId, "Note: bridge mode requires !new to apply changes.");
+      }
+    } catch {
+      await matrix.sendNotice(roomId,
+        `Invalid permission mode. Available: default, acceptEdits, plan, auto, bypassPermissions, allowedTools:...`,
+      );
+    }
+  },
+
   "!lines": async (roomId, args) => {
     if (mode !== "bridge") {
       await matrix.sendNotice(roomId, "!lines is only available in bridge mode.");
@@ -228,7 +275,10 @@ const HELP_TEXTS: Record<string, string> = {
     "  !projects      — List available projects",
     "  !status        — Show session and queue info",
     "  !cancel        — Cancel the running task",
+    "  !permission [MODE] — Show/set permission mode",
     "  !help          — Show this help",
+    "",
+    "Permission modes: default, acceptEdits, plan, auto, bypassPermissions",
   ].join("\n"),
 
   bridge: [
@@ -244,8 +294,10 @@ const HELP_TEXTS: Record<string, string> = {
     "  !status        — Show session info and terminal output",
     "  !cancel        — Send Ctrl-C to Claude",
     "  !lines [N]     — Show last N lines of terminal (default: 30)",
+    "  !permission [MODE] — Show/set permission mode",
     "  !help          — Show this help",
     "",
+    "Permission modes: default, acceptEdits, plan, auto, bypassPermissions",
     "Reply 'y' or 'n' to permission prompts.",
   ].join("\n"),
 
@@ -261,8 +313,10 @@ const HELP_TEXTS: Record<string, string> = {
     "  !projects      — List available projects",
     "  !status        — Show session and MCP connection info",
     "  !cancel        — Send SIGINT to Claude",
+    "  !permission [MODE] — Show/set permission mode",
     "  !help          — Show this help",
     "",
+    "Permission modes: default, acceptEdits, plan, auto, bypassPermissions",
     "Reply 'y' to approve diffs or 'n' to reject.",
   ].join("\n"),
 };

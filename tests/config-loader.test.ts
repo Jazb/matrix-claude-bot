@@ -23,7 +23,9 @@ describe("loadConfig", () => {
         key === "MAX_MESSAGE_LENGTH" ||
         key === "TMP_DIR" ||
         key === "SESSIONS_FILE" ||
-        key === "LOG_LEVEL"
+        key === "LOG_LEVEL" ||
+        key === "PERMISSION_MODE" ||
+        key === "HEALTH_PORT"
       ) {
         delete process.env[key];
       }
@@ -42,7 +44,7 @@ describe("loadConfig", () => {
     expect(config.matrix.homeserverUrl).toBe("https://matrix.test");
     expect(config.matrix.accessToken).toBe("syt_test_token");
     expect(config.matrix.allowedUserId).toBe("@user:matrix.test");
-    expect(config.projects.projects).toEqual({ myproject: "/tmp/test-project" });
+    expect(config.projects.projects).toEqual({ myproject: { path: "/tmp/test-project", permission: null } });
     expect(config.projects.defaultProject).toBe("myproject");
     expect(config.groq.apiKey).toBe("gsk_test_key");
   });
@@ -66,7 +68,7 @@ describe("loadConfig", () => {
     const config = loadConfig();
 
     expect(Object.keys(config.projects.projects)).toEqual(["proj1", "proj2", "proj3"]);
-    expect(config.projects.projects["proj2"]).toBe("/tmp/p2");
+    expect(config.projects.projects["proj2"]?.path).toBe("/tmp/p2");
   });
 
   it("defaults to first project when DEFAULT_PROJECT not set", async () => {

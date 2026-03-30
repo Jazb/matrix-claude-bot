@@ -20,6 +20,7 @@ import { marked } from "marked";
 import type { AppConfig } from "../config/schema.js";
 import type { MatrixClientWrapper } from "../matrix/client.js";
 import { SessionStore } from "../claude/session.js";
+import { buildPermissionArgs, resolvePermission } from "../claude/permission-args.js";
 import { McpServer } from "./mcp-server.js";
 import { SerialQueue } from "../queue/serial-queue.js";
 import { splitMessage, createLogger } from "../utils/index.js";
@@ -104,13 +105,13 @@ export class IdeRunner {
 
     const stored = this.sessionStore.get(roomId);
     const project = stored?.project ?? this.config.projects.defaultProject;
-    const cwd = this.config.projects.projects[project];
+    const entry = this.config.projects.projects[project];
 
-    if (!cwd) {
+    if (!entry) {
       throw new Error(`Unknown project "${project}"`);
     }
 
-    const mcp = new McpServer([cwd], `${project}-${roomId.slice(1, 10)}`);
+    const mcp = new McpServer([entry.path], `${project}-${roomId.slice(1, 10)}`);
     mcp.start();
 
     // Set up tool call handler
@@ -139,7 +140,7 @@ export class IdeRunner {
   private runClaude(roomId: string, prompt: string, _mcp: McpServer): Promise<string> {
     const stored = this.sessionStore.get(roomId);
     const project = stored?.project ?? this.config.projects.defaultProject;
-    const cwd = this.config.projects.projects[project];
+    const cwd = this.config.projects.projects[project]?.path;
 
     const env: Record<string, string> = {
       HOME: process.env["HOME"] ?? "/root",
@@ -155,11 +156,13 @@ export class IdeRunner {
     const apiKey = process.env["ANTHROPIC_API_KEY"];
     if (apiKey) env["ANTHROPIC_API_KEY"] = apiKey;
 
+    const perm = resolvePermission(this.config.projects, project, stored?.permissionOverride);
     const args = [
       "-p", prompt,
       "--output-format", "json",
       "--max-turns", String(this.config.claude.maxTurns),
       "--ide",
+      ...buildPermissionArgs(perm),
       ...this.config.bridge.claudeArgs,
     ];
 

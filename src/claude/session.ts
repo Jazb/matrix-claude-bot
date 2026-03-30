@@ -8,6 +8,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { dirname } from "path";
+import type { PermissionConfig } from "../config/schema.js";
 import { createLogger } from "../utils/logger.js";
 
 const log = createLogger("session");
@@ -15,6 +16,8 @@ const log = createLogger("session");
 export interface SessionData {
   sessionId: string | null;
   project: string;
+  /** Per-room permission override (set via !permission command). */
+  permissionOverride?: PermissionConfig | null;
 }
 
 export class SessionStore {

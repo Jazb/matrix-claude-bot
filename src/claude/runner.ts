@@ -14,6 +14,7 @@
 import { spawn } from "child_process";
 import type { ClaudeConfig, ProjectsConfig } from "../config/schema.js";
 import { SessionStore } from "./session.js";
+import { buildPermissionArgs, resolvePermission } from "./permission-args.js";
 import type { SerialQueue } from "../queue/serial-queue.js";
 import { createLogger } from "../utils/logger.js";
 
@@ -39,16 +40,19 @@ export class ClaudeRunner {
   async run(roomId: string, prompt: string): Promise<string> {
     const session = this.sessions.get(roomId);
     const project = session?.project ?? this.projectsConfig.defaultProject;
-    const cwd = this.projectsConfig.projects[project];
+    const entry = this.projectsConfig.projects[project];
 
-    if (!cwd) {
+    if (!entry) {
       throw new Error(`Unknown project "${project}". Available: ${Object.keys(this.projectsConfig.projects).join(", ")}`);
     }
+    const cwd = entry.path;
 
+    const perm = resolvePermission(this.projectsConfig, project, session?.permissionOverride);
     const args = [
       "-p", prompt,
       "--output-format", "json",
       "--max-turns", String(this.config.maxTurns),
+      ...buildPermissionArgs(perm),
     ];
 
     if (session?.sessionId) {

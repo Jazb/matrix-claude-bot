@@ -5,6 +5,35 @@
  * Required variables will cause the bot to exit with a clear error if missing.
  */
 
+// -- Permission modes --
+
+/**
+ * Claude Code permission modes that control how tool calls are approved.
+ *
+ * See: https://code.claude.com/docs/en/permission-modes
+ *
+ * - "default"            — Prompts for commands and edits (standard)
+ * - "acceptEdits"        — Auto-approves file edits, prompts for commands
+ * - "plan"               — Read-only, no file modifications or commands
+ * - "auto"               — AI safety classifier auto-approves most actions
+ * - "bypassPermissions"  — Skips all permission checks (use in isolated envs only)
+ *
+ * Can also specify allowed tools inline: "allowedTools:Bash(npm *),Edit,Read"
+ */
+export type PermissionMode =
+  | "default"
+  | "acceptEdits"
+  | "plan"
+  | "auto"
+  | "bypassPermissions";
+
+export interface PermissionConfig {
+  /** The permission mode to use */
+  mode: PermissionMode;
+  /** Specific tools to pre-approve (--allowedTools). Only used when mode is "default". */
+  allowedTools: string[];
+}
+
 // -- Matrix connection --
 
 export interface MatrixConfig {
@@ -24,15 +53,26 @@ export interface MatrixConfig {
 
 // -- Project mapping --
 
+export interface ProjectEntry {
+  /** Absolute directory path */
+  path: string;
+  /** Permission mode override for this project (null = use global default) */
+  permission: PermissionConfig | null;
+}
+
 export interface ProjectsConfig {
   /**
-   * Map of project name → absolute directory path.
-   * Parsed from PROJECTS env var as comma-separated "name=/path" pairs.
-   * Example: "myproject=/home/user/project,other=/home/user/other"
+   * Map of project name → project entry.
+   * Parsed from PROJECTS env var as comma-separated entries.
+   *
+   * Simple:  "myproject=/home/user/project"
+   * With permission: "myproject=/home/user/project:bypassPermissions"
    */
-  projects: Record<string, string>;
+  projects: Record<string, ProjectEntry>;
   /** Default project name to use when none is specified */
   defaultProject: string;
+  /** Global default permission mode (applies when project has no override) */
+  defaultPermission: PermissionConfig;
 }
 
 // -- Claude Code execution --
