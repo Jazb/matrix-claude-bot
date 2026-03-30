@@ -99,6 +99,16 @@ const COMMANDS: Record<string, (roomId: string, args: string) => Promise<void>> 
     await matrix.sendNotice(roomId, "New session. Context cleared.");
   },
 
+  "!projects": async (roomId) => {
+    const session = sessions.get(roomId);
+    const active = session?.project ?? config.projects.defaultProject;
+    const lines = Object.entries(config.projects.projects).map(
+      ([name, path]) => `${name === active ? "▸" : " "} ${name} → ${path}`,
+    );
+    lines.unshift("Projects:");
+    await matrix.sendNotice(roomId, lines.join("\n"));
+  },
+
   "!project": async (roomId, args) => {
     const name = args.trim().toLowerCase();
     if (!name || !config.projects.projects[name]) {
@@ -207,6 +217,7 @@ const HELP_TEXTS: Record<string, string> = {
     "Commands:",
     "  !new           — Start a new session (clear context)",
     "  !project NAME  — Switch project working directory",
+    "  !projects      — List available projects",
     "  !status        — Show session and queue info",
     "  !cancel        — Cancel the running task",
     "  !help          — Show this help",
@@ -221,6 +232,7 @@ const HELP_TEXTS: Record<string, string> = {
     "Commands:",
     "  !new           — Start a new session (clear context)",
     "  !project NAME  — Switch project working directory",
+    "  !projects      — List available projects",
     "  !status        — Show session info and terminal output",
     "  !cancel        — Send Ctrl-C to Claude",
     "  !lines [N]     — Show last N lines of terminal (default: 30)",
@@ -238,6 +250,7 @@ const HELP_TEXTS: Record<string, string> = {
     "Commands:",
     "  !new           — Start a new session (clear context)",
     "  !project NAME  — Switch project working directory",
+    "  !projects      — List available projects",
     "  !status        — Show session and MCP connection info",
     "  !cancel        — Send SIGINT to Claude",
     "  !help          — Show this help",
