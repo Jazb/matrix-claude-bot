@@ -553,18 +553,15 @@ if (config.bot.healthPort > 0) {
 await matrix.start();
 log.info(`Matrix Claude Bot started (${mode} mode)`);
 
-// Pre-start all project windows in bridge mode
+// Pre-start Claude sessions for all joined rooms in bridge mode
 if (mode === "bridge" && bridge) {
-  try {
-    await bridge.warmupAll();
-  } catch (err) {
-    log.error(`Bridge warmup failed: ${err instanceof Error ? err.message : String(err)}`);
-  }
-
-  // Register joined rooms so hook responses route correctly
   const joinedRooms = await matrix.getJoinedRooms();
   for (const roomId of joinedRooms) {
-    bridge.registerRoom(roomId);
+    try {
+      await bridge.registerRoom(roomId);
+    } catch (err) {
+      log.error(`Bridge warmup failed for ${roomId}: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 }
 

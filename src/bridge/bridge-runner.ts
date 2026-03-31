@@ -1,18 +1,15 @@
 /**
  * Bridge Runner — Orchestrates Claude Code in interactive tmux mode.
  *
- * Runs a single tmux session ("claude-bridge") with one window per configured
- * project. Each window runs Claude Code interactively. Communication happens via:
+ * Each Matrix room gets its own tmux session ("claude-{roomId}"). Claude Code
+ * runs interactively inside the session. Communication happens via:
  *
  * - **Hooks -> IPC socket -> Matrix**: Claude emits hook events (SessionStart,
  *   PreToolUse, Stop, Notification) which are forwarded to the bridge via a
  *   Unix socket. The bridge sends notifications/responses to Matrix.
  *
- * - **Matrix -> tmux send-keys -> Claude**: User messages from Matrix are injected
- *   into the correct project window based on the room's active project.
- *
- * Multiple rooms can share the same project tab. Hook responses are routed to
- * the room that most recently sent a message to that project.
+ * - **Matrix -> tmux -> Claude**: User messages from Matrix are injected
+ *   into the correct room's tmux session.
  */
 
 import { randomUUID } from "crypto";
@@ -33,9 +30,8 @@ export class BridgeRunner {
   private readonly ipc: IPCServer;
   private readonly tmux: TmuxManager;
   private readonly settingsJson: string;
-
-  /** Tracks which room most recently sent a message to each project. */
-  private readonly lastActiveRoom = new Map<string, string>();
+  /** Maps cwd -> roomId for hook event routing. */
+  private readonly cwdToRoom = new Map<string, string>();
 
   constructor(
     private readonly config: AppConfig,
@@ -59,68 +55,51 @@ export class BridgeRunner {
   }
 
   /**
-   * Start all project windows at once. Called once at startup.
+   * Pre-start Claude tmux sessions for all known rooms.
    */
   async warmupAll(): Promise<void> {
-    const projects = this.config.projects.projects;
+    // warmupAll is called before rooms are registered, so nothing to do here.
+    // Sessions are created lazily on first message or via warmup().
+  }
 
-    for (const [projectName, entry] of Object.entries(projects)) {
-      if (this.tmux.isAlive(projectName)) continue;
-
-      const perm = resolvePermission(this.config.projects, projectName);
-      const permArgs = buildPermissionArgs(perm);
-
-      log.info(`Starting window for project "${projectName}" (cwd: ${entry.path})`);
-      this.tmux.startWindow(
-        projectName,
-        entry.path,
-        this.config.claude.binaryPath,
-        [...permArgs, ...this.config.bridge.claudeArgs],
-        this.settingsJson,
-      );
-      await this.waitForReady(projectName);
-      log.info(`Project "${projectName}" ready`);
-    }
+  /**
+   * Pre-start a Claude tmux session for a specific room.
+   */
+  async warmup(roomId: string): Promise<void> {
+    if (this.tmux.isAlive(roomId)) return;
+    log.info(`Warming up Claude session for room ${roomId}`);
+    await this.ensureSession(roomId);
+    await this.waitForReady(roomId);
+    log.info(`Warmup complete for room ${roomId}`);
   }
 
   /**
    * Register a room's project mapping for hook routing.
-   * Called at startup for all joined rooms.
+   * Called at startup for all joined rooms — also warms up the session.
    */
-  registerRoom(roomId: string): void {
+  async registerRoom(roomId: string): Promise<void> {
     const session = this.sessions.get(roomId);
     const project = session?.project ?? this.config.projects.defaultProject;
-    this.lastActiveRoom.set(project, roomId);
-    log.debug(`Registered room ${roomId} -> project "${project}"`);
+    const entry = this.config.projects.projects[project];
+    if (entry) {
+      this.cwdToRoom.set(entry.path, roomId);
+    }
+    // Warm up the session so it's ready when the user sends a message
+    await this.warmup(roomId);
   }
 
   /**
    * Handle a user message for a room.
-   * Routes the message to the correct project window.
+   * Ensures a tmux session exists, then injects the text as input.
    */
   async handleMessage(roomId: string, prompt: string): Promise<null> {
-    const project = this.resolveProject(roomId);
-
-    // Ensure the window is alive, restart if dead
-    if (!this.tmux.isAlive(project)) {
-      const entry = this.config.projects.projects[project];
-      if (!entry) throw new Error(`Unknown project "${project}"`);
-
-      const perm = resolvePermission(this.config.projects, project);
-      this.tmux.startWindow(
-        project,
-        entry.path,
-        this.config.claude.binaryPath,
-        [...buildPermissionArgs(perm), ...this.config.bridge.claudeArgs],
-        this.settingsJson,
-      );
-      await this.waitForReady(project);
+    const isNew = !this.tmux.isAlive(roomId);
+    if (isNew) {
+      await this.ensureSession(roomId);
+      await this.waitForReady(roomId);
     }
 
-    // Track which room is active for this project (for hook routing)
-    this.lastActiveRoom.set(project, roomId);
-
-    const sent = this.tmux.sendInput(project, prompt);
+    const sent = this.tmux.sendInput(roomId, prompt);
     if (!sent) {
       await this.matrix.sendNotice(roomId, "Failed to send input to Claude session. Try !new to restart.");
     }
@@ -129,52 +108,38 @@ export class BridgeRunner {
     return null;
   }
 
-  /** Start a new Claude session for a room's current project. */
+  /** Start a new session for a room (kills existing if any). */
   async newSession(roomId: string): Promise<void> {
-    const project = this.resolveProject(roomId);
-
-    // Kill and restart the project window
-    this.tmux.killWindow(project);
+    this.tmux.killSession(roomId);
     this.sessions.clear(roomId);
 
-    const entry = this.config.projects.projects[project];
-    if (!entry) throw new Error(`Unknown project "${project}"`);
-
-    const perm = resolvePermission(this.config.projects, project);
-    this.tmux.startWindow(
-      project,
-      entry.path,
-      this.config.claude.binaryPath,
-      [...buildPermissionArgs(perm), ...this.config.bridge.claudeArgs],
-      this.settingsJson,
-    );
-    await this.waitForReady(project);
+    // Clean up cwd→room mapping for this room
+    for (const [cwd, rid] of this.cwdToRoom) {
+      if (rid === roomId) this.cwdToRoom.delete(cwd);
+    }
   }
 
   /**
-   * Switch a room to a different project. The target window already exists
-   * (created at warmup), so this just updates the mapping.
+   * Switch a room to a different project. Kills the current session
+   * and starts a new one in the new project's directory.
    */
   async switchProject(roomId: string, project: string): Promise<void> {
     const entry = this.config.projects.projects[project];
     if (!entry) throw new Error(`Unknown project "${project}"`);
 
-    // Update session mapping
+    // Kill old session and update mapping
+    this.tmux.killSession(roomId);
     this.sessions.set(roomId, { project, sessionId: null });
-    this.lastActiveRoom.set(project, roomId);
 
-    // Ensure the window is alive
-    if (!this.tmux.isAlive(project)) {
-      const perm = resolvePermission(this.config.projects, project);
-      this.tmux.startWindow(
-        project,
-        entry.path,
-        this.config.claude.binaryPath,
-        [...buildPermissionArgs(perm), ...this.config.bridge.claudeArgs],
-        this.settingsJson,
-      );
-      await this.waitForReady(project);
+    // Clean up old cwd mapping, set new one
+    for (const [cwd, rid] of this.cwdToRoom) {
+      if (rid === roomId) this.cwdToRoom.delete(cwd);
     }
+    this.cwdToRoom.set(entry.path, roomId);
+
+    // Start new session in the new project
+    await this.ensureSession(roomId);
+    await this.waitForReady(roomId);
 
     await this.matrix.sendNotice(
       roomId,
@@ -182,17 +147,15 @@ export class BridgeRunner {
     );
   }
 
-  /** Cancel the current operation (send Ctrl-C to the project window). */
+  /** Cancel the current operation (send Ctrl-C). */
   cancel(roomId: string): boolean {
-    const project = this.resolveProject(roomId);
-    return this.tmux.sendInterrupt(project);
+    return this.tmux.sendInterrupt(roomId);
   }
 
-  /** Get tmux status for a room's active project. */
+  /** Get tmux status for a room. */
   getStatus(roomId: string, lineCount: number = 10): { alive: boolean; lines: string | null } {
-    const project = this.resolveProject(roomId);
-    const alive = this.tmux.isAlive(project);
-    const lines = alive ? this.tmux.captureLines(project, lineCount) : null;
+    const alive = this.tmux.isAlive(roomId);
+    const lines = alive ? this.tmux.captureLines(roomId, lineCount) : null;
     return { alive, lines };
   }
 
@@ -203,31 +166,52 @@ export class BridgeRunner {
     log.info("Bridge runner stopped");
   }
 
-  // -- Private ----------------------------------------------------------------
+  // ── Private ────────────────────────────────────────────────────────────────
 
-  /** Resolve the active project name for a room. */
-  private resolveProject(roomId: string): string {
+  /** Ensure a tmux session exists for a room, creating one if needed. */
+  private async ensureSession(roomId: string): Promise<void> {
     const session = this.sessions.get(roomId);
-    return session?.project ?? this.config.projects.defaultProject;
+    const project = session?.project ?? this.config.projects.defaultProject;
+    const entry = this.config.projects.projects[project];
+
+    if (!entry) {
+      throw new Error(`Unknown project "${project}"`);
+    }
+
+    // Track cwd→room mapping for hook event routing
+    this.cwdToRoom.set(entry.path, roomId);
+
+    const perm = resolvePermission(this.config.projects, project, session?.permissionOverride);
+    const permArgs = buildPermissionArgs(perm);
+
+    this.tmux.startSession(
+      roomId,
+      project,
+      entry.path,
+      this.config.claude.binaryPath,
+      [...permArgs, ...this.config.bridge.claudeArgs],
+      this.settingsJson,
+    );
   }
 
   /**
-   * Wait for Claude Code to be ready in a project window.
+   * Wait for Claude Code to be ready after starting a new tmux session.
+   * Polls the tmux pane output looking for the input prompt indicator.
    */
-  private waitForReady(project: string, timeoutMs: number = 30000): Promise<void> {
+  private waitForReady(roomId: string, timeoutMs: number = 30000): Promise<void> {
     return new Promise((resolve) => {
       const start = Date.now();
       const interval = setInterval(() => {
-        const lines = this.tmux.captureLines(project, 5);
+        const lines = this.tmux.captureLines(roomId, 5);
         if (lines && /[>❯]/m.test(lines)) {
           clearInterval(interval);
-          log.info(`Claude ready in project "${project}"`);
+          log.info(`Claude session ready for room ${roomId}`);
           resolve();
           return;
         }
         if (Date.now() - start > timeoutMs) {
           clearInterval(interval);
-          log.warn(`Timed out waiting for Claude to be ready in project "${project}", proceeding anyway`);
+          log.warn(`Timed out waiting for Claude to be ready in room ${roomId}, proceeding anyway`);
           resolve();
         }
       }, 500);
@@ -236,7 +220,7 @@ export class BridgeRunner {
 
   /** Route and handle a hook event from Claude Code. */
   private async handleHookEvent(payload: HookPayload): Promise<void> {
-    const roomId = this.resolveRoomFromHook(payload);
+    const roomId = this.resolveRoom(payload);
     if (!roomId) {
       log.debug(`Could not resolve room for hook event: ${payload.hook_event_name} (cwd: ${payload.cwd})`);
       return;
@@ -262,7 +246,8 @@ export class BridgeRunner {
 
   private async handleSessionStart(roomId: string, payload: HookPayload): Promise<void> {
     if (payload.session_id) {
-      const project = this.resolveProject(roomId);
+      const session = this.sessions.get(roomId);
+      const project = session?.project ?? this.config.projects.defaultProject;
       this.sessions.set(roomId, { sessionId: payload.session_id, project });
     }
     await this.matrix.setTyping(roomId, true);
@@ -359,22 +344,19 @@ export class BridgeRunner {
     }
   }
 
-  /**
-   * Resolve which Matrix room a hook event belongs to.
-   * Uses cwd -> project -> lastActiveRoom mapping.
-   */
-  private resolveRoomFromHook(payload: HookPayload): string | undefined {
+  /** Resolve which Matrix room a hook event belongs to, using cwd. */
+  private resolveRoom(payload: HookPayload): string | undefined {
     if (payload.cwd) {
-      const project = this.tmux.findProjectByCwd(payload.cwd);
-      if (project) {
-        const roomId = this.lastActiveRoom.get(project);
-        if (roomId) return roomId;
-      }
+      const roomId = this.cwdToRoom.get(payload.cwd);
+      if (roomId) return roomId;
+
+      const tmuxRoom = this.tmux.findRoomByCwd(payload.cwd);
+      if (tmuxRoom) return tmuxRoom;
     }
 
-    // Fallback: if only one room is active, use it
-    if (this.lastActiveRoom.size === 1) {
-      return [...this.lastActiveRoom.values()][0];
+    // Fallback: if only one room exists, use it
+    if (this.cwdToRoom.size === 1) {
+      return [...this.cwdToRoom.values()][0];
     }
 
     return undefined;

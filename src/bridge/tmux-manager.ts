@@ -1,33 +1,32 @@
 /**
- * Tmux Manager — Manages a single tmux session with per-project windows.
+ * Tmux Manager — Manages tmux sessions for Claude Code in bridge mode.
  *
- * Instead of one tmux session per Matrix room, we run ONE session ("claude-bridge")
- * with multiple windows (tabs). Each window is named after a project and runs
- * Claude Code in that project's directory.
+ * Each Matrix room maps to its own tmux session named "claude-{roomId}".
+ * User messages are injected via tmux load-buffer + paste-buffer (no size
+ * limit, unlike send-keys -l which truncates at ~2048 bytes).
  *
- * Matrix rooms are mapped to projects, and messages are routed to the correct
- * tmux window based on the room's active project.
+ * Claude's output is captured via hooks, not terminal parsing.
  */
 
 import { execSync } from "child_process";
+import { writeFileSync, unlinkSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
 import { createLogger } from "../utils/logger.js";
 
 const log = createLogger("tmux");
 
-const SESSION_NAME = "claude-bridge";
-
-interface TmuxWindow {
+interface TmuxSession {
+  sessionName: string;
   project: string;
   cwd: string;
 }
 
 export class TmuxManager {
-  private readonly windows = new Map<string, TmuxWindow>();
-  private sessionCreated = false;
+  private readonly sessions = new Map<string, TmuxSession>();
 
   constructor() {
     this.checkTmuxInstalled();
-    this.detectExistingSession();
   }
 
   private checkTmuxInstalled(): void {
@@ -38,127 +37,103 @@ export class TmuxManager {
     }
   }
 
-  /** Detect if a previous session exists (e.g., after a bot crash). */
-  private detectExistingSession(): void {
-    try {
-      execSync(`tmux has-session -t "${SESSION_NAME}"`, { stdio: "pipe" });
-      // Stale session from a previous run — kill it for a clean start
-      log.info(`Killing stale tmux session "${SESSION_NAME}"`);
-      execSync(`tmux kill-session -t "${SESSION_NAME}"`, { stdio: "pipe" });
-    } catch {
-      // No existing session — good
-    }
-  }
-
   /**
-   * Start a new tmux window for a project.
-   * On the first call, creates the tmux session with the first window.
-   * Subsequent calls add windows to the existing session.
+   * Start a new tmux session for a Matrix room with Claude Code running inside.
    */
-  startWindow(
+  startSession(
+    roomId: string,
     project: string,
     cwd: string,
     claudeBinaryPath: string,
     claudeArgs: string[],
     settingsJson: string,
   ): void {
-    // Kill existing window for this project if any
-    if (this.windows.has(project)) {
-      this.killWindow(project);
+    // Kill existing session for this room if any
+    if (this.sessions.has(roomId)) {
+      this.killSession(roomId);
     }
 
-    const windowName = this.sanitizeWindowName(project);
+    const sessionName = this.roomIdToSessionName(roomId);
 
-    if (!this.sessionCreated) {
-      // First window — create the session
+    // Create detached tmux session
+    try {
+      execSync(`tmux new-session -d -s "${sessionName}" -c "${cwd}"`, { stdio: "pipe" });
+    } catch {
+      // Session might already exist from a previous crash
       try {
-        execSync(
-          `tmux new-session -d -s "${SESSION_NAME}" -n "${windowName}" -c "${cwd}"`,
-          { stdio: "pipe" },
-        );
-        this.sessionCreated = true;
-      } catch (err) {
-        throw new Error(
-          `Failed to create tmux session: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-    } else {
-      // Additional window — add to existing session
-      try {
-        execSync(
-          `tmux new-window -t "${SESSION_NAME}" -n "${windowName}" -c "${cwd}"`,
-          { stdio: "pipe" },
-        );
-      } catch (err) {
-        throw new Error(
-          `Failed to create tmux window "${windowName}": ${err instanceof Error ? err.message : String(err)}`,
-        );
+        execSync(`tmux kill-session -t "${sessionName}"`, { stdio: "pipe" });
+        execSync(`tmux new-session -d -s "${sessionName}" -c "${cwd}"`, { stdio: "pipe" });
+      } catch (err2) {
+        throw new Error(`Failed to create tmux session "${sessionName}": ${err2 instanceof Error ? err2.message : String(err2)}`);
       }
     }
 
-    // Build and send the Claude command
+    // Build the Claude command with --settings for hooks
     const args = ["--settings", `'${settingsJson}'`, ...claudeArgs];
     const cmd = `${claudeBinaryPath} ${args.join(" ")}`;
-    const target = `${SESSION_NAME}:${windowName}`;
 
-    execSync(`tmux send-keys -t "${target}" ${this.escapeForShell(cmd)} C-m`, {
-      stdio: "pipe",
-    });
+    // Send the command to the tmux session
+    execSync(`tmux send-keys -t "${sessionName}" ${this.escapeForShell(cmd)} C-m`, { stdio: "pipe" });
 
-    this.windows.set(project, { project, cwd });
-    log.info(`Started tmux window "${windowName}" for project "${project}" in ${cwd}`);
+    this.sessions.set(roomId, { sessionName, project, cwd });
+    log.info(`Started tmux session "${sessionName}" for room ${roomId} (project: ${project}, cwd: ${cwd})`);
   }
 
   /**
-   * Send user input to the tmux window for a project.
+   * Send user input to the tmux session for a room.
+   *
+   * Uses tmux load-buffer + paste-buffer instead of send-keys -l to avoid
+   * the ~2048 byte limit that silently truncates long messages.
    */
-  sendInput(project: string, text: string): boolean {
-    const window = this.windows.get(project);
-    if (!window) {
-      log.warn(`No tmux window for project "${project}"`);
+  sendInput(roomId: string, text: string): boolean {
+    const session = this.sessions.get(roomId);
+    if (!session) {
+      log.warn(`No tmux session for room ${roomId}`);
       return false;
     }
 
-    const target = `${SESSION_NAME}:${this.sanitizeWindowName(project)}`;
-
     try {
-      const escaped = this.escapeForTmux(text);
-      execSync(`tmux send-keys -t "${target}" -l ${escaped}`, { stdio: "pipe" });
-      execSync(`tmux send-keys -t "${target}" C-m`, { stdio: "pipe" });
-      log.debug(`Sent input to tmux window "${project}"`);
+      const tmpFile = join(tmpdir(), `tmux-input-${process.pid}-${Date.now()}`);
+      writeFileSync(tmpFile, text);
+
+      try {
+        execSync(`tmux load-buffer "${tmpFile}"`, { stdio: "pipe" });
+        execSync(`tmux paste-buffer -d -t "${session.sessionName}"`, { stdio: "pipe" });
+        execSync(`tmux send-keys -t "${session.sessionName}" C-m`, { stdio: "pipe" });
+      } finally {
+        try { unlinkSync(tmpFile); } catch { /* best-effort cleanup */ }
+      }
+
+      log.debug(`Sent input to tmux session "${session.sessionName}" (${text.length} chars)`);
       return true;
     } catch (err) {
-      log.error(`Failed to send to tmux window "${project}": ${err instanceof Error ? err.message : String(err)}`);
+      log.error(`Failed to send to tmux "${session.sessionName}": ${err instanceof Error ? err.message : String(err)}`);
       return false;
     }
   }
 
-  /** Send Ctrl-C to the tmux window for a project. */
-  sendInterrupt(project: string): boolean {
-    const window = this.windows.get(project);
-    if (!window) return false;
-
-    const target = `${SESSION_NAME}:${this.sanitizeWindowName(project)}`;
+  /** Send Ctrl-C to the tmux session (cancel current operation). */
+  sendInterrupt(roomId: string): boolean {
+    const session = this.sessions.get(roomId);
+    if (!session) return false;
 
     try {
-      execSync(`tmux send-keys -t "${target}" C-c`, { stdio: "pipe" });
-      log.info(`Sent Ctrl-C to tmux window "${project}"`);
+      execSync(`tmux send-keys -t "${session.sessionName}" C-c`, { stdio: "pipe" });
+      log.info(`Sent Ctrl-C to tmux session "${session.sessionName}"`);
       return true;
     } catch {
       return false;
     }
   }
 
-  /** Capture the last N lines from the tmux pane for a project. */
-  captureLines(project: string, lineCount: number = 30): string | null {
-    const window = this.windows.get(project);
-    if (!window) return null;
-
-    const target = `${SESSION_NAME}:${this.sanitizeWindowName(project)}`;
+  /** Capture the last N lines from the tmux pane. */
+  captureLines(roomId: string, lineCount: number = 30): string | null {
+    const session = this.sessions.get(roomId);
+    if (!session) return null;
 
     try {
       const output = execSync(
-        `tmux capture-pane -t "${target}" -p -S -${lineCount}`,
+        `tmux capture-pane -t "${session.sessionName}" -p -S -${lineCount}`,
         { stdio: "pipe", encoding: "utf-8" },
       );
       return output.trimEnd();
@@ -167,96 +142,65 @@ export class TmuxManager {
     }
   }
 
-  /** Kill a single project window. */
-  killWindow(project: string): void {
-    const window = this.windows.get(project);
-    if (!window) return;
-
-    const target = `${SESSION_NAME}:${this.sanitizeWindowName(project)}`;
+  /** Kill the tmux session for a room. */
+  killSession(roomId: string): void {
+    const session = this.sessions.get(roomId);
+    if (!session) return;
 
     try {
-      execSync(`tmux kill-window -t "${target}"`, { stdio: "pipe" });
-      log.info(`Killed tmux window "${project}"`);
+      execSync(`tmux kill-session -t "${session.sessionName}"`, { stdio: "pipe" });
+      log.info(`Killed tmux session "${session.sessionName}"`);
     } catch {
-      // Window might already be dead
+      // Session might already be dead
     }
 
-    this.windows.delete(project);
+    this.sessions.delete(roomId);
+  }
 
-    // If no windows left, session is dead
-    if (this.windows.size === 0) {
-      this.sessionCreated = false;
+  /** Check if the tmux session for a room is still alive. */
+  isAlive(roomId: string): boolean {
+    const session = this.sessions.get(roomId);
+    if (!session) return false;
+
+    try {
+      execSync(`tmux has-session -t "${session.sessionName}"`, { stdio: "pipe" });
+      return true;
+    } catch {
+      // Session is dead — clean up our map
+      this.sessions.delete(roomId);
+      return false;
     }
   }
 
-  /** Check if the tmux window for a project is still alive. */
-  isAlive(project: string): boolean {
-    const window = this.windows.get(project);
-    if (!window) return false;
-
-    try {
-      // List windows and check if ours exists
-      const output = execSync(
-        `tmux list-windows -t "${SESSION_NAME}" -F "#{window_name}"`,
-        { stdio: "pipe", encoding: "utf-8" },
-      );
-      const windowNames = output.trim().split("\n");
-      if (windowNames.includes(this.sanitizeWindowName(project))) {
-        return true;
-      }
-    } catch {
-      // Session might be dead
-    }
-
-    this.windows.delete(project);
-    if (this.windows.size === 0) this.sessionCreated = false;
-    return false;
+  /** Get session info for a room. */
+  getSession(roomId: string): TmuxSession | undefined {
+    return this.sessions.get(roomId);
   }
 
-  /** Find the project name for a given cwd (supports subdirectories). */
-  findProjectByCwd(cwd: string): string | undefined {
-    // Exact match first
-    for (const [project, window] of this.windows) {
-      if (window.cwd === cwd) return project;
+  /** Find the room ID for a given cwd. */
+  findRoomByCwd(cwd: string): string | undefined {
+    for (const [roomId, session] of this.sessions) {
+      if (session.cwd === cwd) return roomId;
     }
     // Subdirectory match
-    for (const [project, window] of this.windows) {
-      if (cwd.startsWith(window.cwd)) return project;
+    for (const [roomId, session] of this.sessions) {
+      if (cwd.startsWith(session.cwd)) return roomId;
     }
     return undefined;
   }
 
-  /** Get all tracked project names. */
-  getProjects(): string[] {
-    return [...this.windows.keys()];
-  }
-
-  /** Kill the entire tmux session. */
+  /** Kill all tmux sessions. */
   killAll(): void {
-    try {
-      execSync(`tmux kill-session -t "${SESSION_NAME}"`, { stdio: "pipe" });
-      log.info(`Killed tmux session "${SESSION_NAME}"`);
-    } catch {
-      // Session might already be dead
+    for (const roomId of [...this.sessions.keys()]) {
+      this.killSession(roomId);
     }
-    this.windows.clear();
-    this.sessionCreated = false;
   }
 
-  /** Sanitize project name for use as tmux window name. */
-  private sanitizeWindowName(project: string): string {
-    // tmux doesn't allow dots or colons in window names
-    return project.replace(/[.:]/g, "-");
-  }
-
-  /** Escape text for tmux send-keys -l (literal mode). */
-  private escapeForTmux(text: string): string {
-    const escaped = text
-      .replace(/\\/g, "\\\\")
-      .replace(/"/g, '\\"')
-      .replace(/\$/g, "\\$")
-      .replace(/`/g, "\\`");
-    return `"${escaped}"`;
+  /** Convert a Matrix room ID to a valid tmux session name. */
+  private roomIdToSessionName(roomId: string): string {
+    // Room IDs like "!abc123:matrix.org" → "claude-abc123"
+    const cleaned = roomId.replace(/^!/, "").replace(/:.*$/, "").replace(/[^a-zA-Z0-9]/g, "");
+    return `claude-${cleaned.slice(0, 20)}`;
   }
 
   /** Escape a command for shell execution. */
