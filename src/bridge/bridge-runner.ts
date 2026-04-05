@@ -269,6 +269,19 @@ export class BridgeRunner {
       await this.matrix.sendHtmlMessage(roomId, text, html);
       await this.matrix.setTyping(roomId, false);
     } else {
+      // PreToolUse fires for every tool regardless of whether the user needs
+      // to approve it.  Real permission prompts arrive via the Notification
+      // hook with notification_type "permission_prompt", which only fires when
+      // Claude actually blocks waiting for user input.  In modes that
+      // auto-approve some or all tools (auto, acceptEdits, bypassPermissions)
+      // suppress this banner to avoid flooding with spurious notifications.
+      // Mode "default" and "plan" still need PreToolUse because all tools
+      // require explicit approval (and Notification may arrive after a delay).
+      const perm = this.getEffectivePermission(roomId);
+      if (perm.mode !== "default" && perm.mode !== "plan") {
+        return;
+      }
+
       let text = `**Permission Required**: \`${payload.tool_name}\`\n`;
 
       const toolInput = payload.tool_input;
@@ -342,6 +355,13 @@ export class BridgeRunner {
       const html = await marked.parse(text);
       await this.matrix.sendHtmlMessage(roomId, text, html);
     }
+  }
+
+  /** Get the effective permission config for a room. */
+  private getEffectivePermission(roomId: string): import("../config/schema.js").PermissionConfig {
+    const session = this.sessions.get(roomId);
+    const project = session?.project ?? this.config.projects.defaultProject;
+    return resolvePermission(this.config.projects, project, session?.permissionOverride);
   }
 
   /** Resolve which Matrix room a hook event belongs to, using cwd. */
