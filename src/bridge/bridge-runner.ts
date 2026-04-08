@@ -32,6 +32,8 @@ export class BridgeRunner {
   private readonly settingsJson: string;
   /** Maps cwd -> roomId for hook event routing. */
   private readonly cwdToRoom = new Map<string, string>();
+  /** Stores the last PreToolUse payload per room so Notification hooks can include tool details. */
+  private readonly pendingToolUse = new Map<string, HookPayload>();
 
   constructor(
     private readonly config: AppConfig,
@@ -269,6 +271,11 @@ export class BridgeRunner {
       await this.matrix.sendHtmlMessage(roomId, text, html);
       await this.matrix.setTyping(roomId, false);
     } else {
+      // Always store the latest PreToolUse so that the Notification hook
+      // (permission_prompt) can include tool details — the Notification
+      // payload from Claude Code only carries a generic message string.
+      this.pendingToolUse.set(roomId, payload);
+
       // PreToolUse fires for every tool regardless of whether the user needs
       // to approve it.  Real permission prompts arrive via the Notification
       // hook with notification_type "permission_prompt", which only fires when
@@ -328,18 +335,26 @@ export class BridgeRunner {
     } else if (payload.notification_type === "permission_prompt") {
       await this.matrix.setTyping(roomId, false);
 
+      // The Notification hook from Claude Code only carries a generic message
+      // (e.g. "Claude needs your permission to use Bash") without tool_name
+      // or tool_input.  Enrich it with the last PreToolUse payload we saved.
+      const pending = this.pendingToolUse.get(roomId);
+      const toolName = payload.tool_name ?? pending?.tool_name;
+      const toolInput = payload.tool_input ?? pending?.tool_input;
+      // Consume the pending entry so it isn't reused for unrelated prompts.
+      this.pendingToolUse.delete(roomId);
+
       let text = `**Permission Required**`;
-      if (payload.tool_name) {
-        text += `: \`${payload.tool_name}\`\n`;
+      if (toolName) {
+        text += `: \`${toolName}\`\n`;
       }
 
-      const toolInput = payload.tool_input;
       if (toolInput) {
-        if (payload.tool_name === "Bash" && toolInput.command) {
+        if (toolName === "Bash" && toolInput.command) {
           text += `\n\`\`\`bash\n${String(toolInput.command)}\n\`\`\``;
-        } else if ((payload.tool_name === "Edit" || payload.tool_name === "Write") && toolInput.file_path) {
+        } else if ((toolName === "Edit" || toolName === "Write") && toolInput.file_path) {
           text += `\nFile: \`${String(toolInput.file_path)}\``;
-        } else if (payload.tool_name === "Read" && toolInput.file_path) {
+        } else if (toolName === "Read" && toolInput.file_path) {
           text += `\nFile: \`${String(toolInput.file_path)}\``;
         } else {
           text += `\n\`\`\`json\n${JSON.stringify(toolInput, null, 2)}\n\`\`\``;
