@@ -229,7 +229,8 @@ const COMMANDS: Record<string, (roomId: string, args: string) => Promise<void>> 
       const perm = resolvePermission(config.projects, project);
       await matrix.sendNotice(roomId, `Permission reset to: ${permissionLabel(perm)}`);
       if (mode === "bridge") {
-        await matrix.sendNotice(roomId, "Note: bridge mode requires !new to apply changes.");
+        await bridge!.newSession(roomId);
+        await matrix.sendNotice(roomId, "Session restarted with updated permissions.");
       }
       return;
     }
@@ -239,7 +240,8 @@ const COMMANDS: Record<string, (roomId: string, args: string) => Promise<void>> 
       sessions.set(roomId, { ...session, project, sessionId: session?.sessionId ?? null, permissionOverride: perm });
       await matrix.sendNotice(roomId, `Permission mode set: ${permissionLabel(perm)}`);
       if (mode === "bridge") {
-        await matrix.sendNotice(roomId, "Note: bridge mode requires !new to apply changes.");
+        await bridge!.newSession(roomId);
+        await matrix.sendNotice(roomId, "Session restarted with updated permissions.");
       }
     } catch {
       await matrix.sendNotice(roomId,
