@@ -36,6 +36,9 @@ export function generateHooksSettings(socketPath: string, hookTimeout: number): 
       Stop: [hookEntry()],
       Notification: [hookEntry()],
     },
+    // Auto-accept the bypass-permissions confirmation prompt so interactive
+    // tmux sessions don't hang waiting for user input.
+    skipDangerousModePermissionPrompt: true,
   };
 
   return JSON.stringify(settings);
