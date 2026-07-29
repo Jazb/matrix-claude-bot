@@ -112,6 +112,8 @@ export interface BotConfig {
   logLevel: string;
   /** Port for HTTP health check endpoint (0 = disabled) */
   healthPort: number;
+  /** Path to Claude Code's OAuth credentials file (defaults to ~/.claude/.credentials.json) */
+  credentialsPath?: string;
 }
 
 // -- Bridge mode --

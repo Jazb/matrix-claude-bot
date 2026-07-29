@@ -44,12 +44,20 @@ import { createLogger } from "../utils/logger.js";
 // Redirect matrix-js-sdk console output to stderr to keep stdout/app logs clean.
 // SDK logs are visible via `pm2 logs --err` or stderr redirection.
 // Set LOG_LEVEL=debug to keep SDK logs on stdout instead.
+//
+// The SDK logs every sync and every encryption step at debug level. Forwarding
+// those unconditionally buries the bot's own lines and grows the log without
+// bound (it reached 108 MB on nexusd), so debug/info from the SDK are dropped
+// unless the configured level actually asks for them.
 if (process.env["LOG_LEVEL"] !== "debug") {
+  const level = process.env["LOG_LEVEL"] ?? "info";
   const _stderr = (prefix: string) => (...args: unknown[]) =>
     process.stderr.write(`${prefix} ${args.join(" ")}\n`);
+  const _drop = () => {};
+
   console.log = _stderr("[sdk]");
-  console.debug = _stderr("[sdk:debug]");
-  console.info = _stderr("[sdk:info]");
+  console.debug = _drop;
+  console.info = level === "info" ? _stderr("[sdk:info]") : _drop;
   console.warn = _stderr("[sdk:warn]");
 }
 

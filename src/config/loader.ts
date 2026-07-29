@@ -150,6 +150,8 @@ export function loadConfig(): AppConfig {
       sessionsFile: optional("SESSIONS_FILE", "./data/sessions.json"),
       logLevel: optional("LOG_LEVEL", "info"),
       healthPort: Number(optional("HEALTH_PORT", "8081")),
+      // Undefined lets the health check fall back to ~/.claude/.credentials.json
+      credentialsPath: process.env["CLAUDE_CREDENTIALS_PATH"] || undefined,
     },
     bridge: {
       mode: (optional("BOT_MODE", "bot") as "bot" | "bridge" | "ide"),

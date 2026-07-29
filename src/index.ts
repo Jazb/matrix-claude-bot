@@ -547,7 +547,7 @@ async function downloadContentToFile(
 // ─── Health check ───────────────────────────────────────────────────────────
 
 if (config.bot.healthPort > 0) {
-  startHealthServer(config.bot.healthPort, matrix);
+  startHealthServer(config.bot.healthPort, matrix, config.bot.credentialsPath);
 }
 
 // ─── Start ───────────────────────────────────────────────────────────────────
